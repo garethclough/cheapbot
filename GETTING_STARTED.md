@@ -103,3 +103,17 @@ ros2 run nav2_map_server map_saver_cli -f ~/floorscan_map
 
 # Tutorial
 https://gazebosim.org/docs/latest/building_robot/
+https://gazebosim.org/api/transport/15/messages.html
+
+# Run world
+gz sim building_robot.sdf
+
+# Gz setup - this exposes gz command & make it permanent
+source /opt/ros/jazzy/setup.bash
+echo 'source /opt/ros/jazzy/setup.bash' >> ~/.bashrc
+
+# Move bot
+gz topic -t "/cmd_vel" -m gz.msgs.Twist -p "linear: {x: 0.5}, angular: {z: 0.05}"
+
+# Lidar messages
+gz topic -e -t /lidar
