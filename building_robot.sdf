@@ -112,9 +112,10 @@
             </attenuation>
             <direction>-0.5 0.1 -0.9</direction>
         </light>
-        <model name='wall'>
+        <!-- Right wall -->
+        <model name='wall_right'>
             <static>true</static>
-            <pose>5 0 0 0 0 0</pose><!--pose relative to the world-->
+            <pose>5 0 0 0 0 0</pose>
             <link name='box'>
                 <visual name='visual'>
                     <geometry>
@@ -122,7 +123,87 @@
                             <size>0.5 10.0 2.0</size>
                         </box>
                     </geometry>
-                    <!--let's add color to our link-->
+                    <material>
+                        <ambient>0.0 0.0 1.0 1</ambient>
+                        <diffuse>0.0 0.0 1.0 1</diffuse>
+                        <specular>0.0 0.0 1.0 1</specular>
+                    </material>
+                </visual>
+                <collision name='collision'>
+                    <geometry>
+                        <box>
+                            <size>0.5 10.0 2.0</size>
+                        </box>
+                    </geometry>
+                </collision>
+            </link>
+        </model>
+
+        <!-- Left wall -->
+        <model name='wall_left'>
+            <static>true</static>
+            <pose>-5 0 0 0 0 0</pose>
+            <link name='box'>
+                <visual name='visual'>
+                    <geometry>
+                        <box>
+                            <size>0.5 10.0 2.0</size>
+                        </box>
+                    </geometry>
+                    <material>
+                        <ambient>0.0 0.0 1.0 1</ambient>
+                        <diffuse>0.0 0.0 1.0 1</diffuse>
+                        <specular>0.0 0.0 1.0 1</specular>
+                    </material>
+                </visual>
+                <collision name='collision'>
+                    <geometry>
+                        <box>
+                            <size>0.5 10.0 2.0</size>
+                        </box>
+                    </geometry>
+                </collision>
+            </link>
+        </model>
+
+        <!-- Top wall -->
+        <model name='wall_top'>
+            <static>true</static>
+            <pose>0 5 0 0 0 1.5708</pose>
+            <link name='box'>
+                <visual name='visual'>
+                    <geometry>
+                        <box>
+                            <size>0.5 10.0 2.0</size>
+                        </box>
+                    </geometry>
+                    <material>
+                        <ambient>0.0 0.0 1.0 1</ambient>
+                        <diffuse>0.0 0.0 1.0 1</diffuse>
+                        <specular>0.0 0.0 1.0 1</specular>
+                    </material>
+                </visual>
+                <collision name='collision'>
+                    <geometry>
+                        <box>
+                            <size>0.5 10.0 2.0</size>
+                        </box>
+                    </geometry>
+                </collision>
+            </link>
+        </model>
+
+        <!-- Bottom wall -->
+        <model name='wall_bottom'>
+            <static>true</static>
+            <pose>0 -5 0 0 0 1.5708</pose>
+            <link name='box'>
+                <visual name='visual'>
+                    <geometry>
+                        <box>
+                            <size>0.5 10.0 2.0</size>
+                        </box>
+                    </geometry>
                     <material>
                         <ambient>0.0 0.0 1.0 1</ambient>
                         <diffuse>0.0 0.0 1.0 1</diffuse>
@@ -173,6 +254,7 @@
                 <wheel_radius>0.4</wheel_radius>
                 <odom_publish_frequency>1</odom_publish_frequency>
                 <topic>cmd_vel</topic>
+                <odom_topic>/odom</odom_topic>
             </plugin>
             <!-- Moving Forward-->
             <plugin filename="gz-sim-triggered-publisher-system"
