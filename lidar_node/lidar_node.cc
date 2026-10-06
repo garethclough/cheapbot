@@ -19,16 +19,37 @@
 #include <gz/msgs/laserscan.pb.h>
 #include <gz/transport/Node.hh>
 #include <gz/msgs/imu.pb.h>
+#include <gz/msgs/odometry.pb.h>
+#include <cmath>
+#include "min_max_xy.hh"
 
 
 std::string topic_pub = "/cmd_vel";   //publish to this topic
 gz::transport::Node node;
 auto pub = node.Advertise<gz::msgs::Twist>(topic_pub);
+std::optional<float> maxX;
+MinMaxXY limits;
+
+void odomCb(const gz::msgs::Odometry &msg)
+{
+    const auto &pose = msg.pose();
+
+    if (limits.update(
+        pose.position().x(),
+        pose.position().y()))
+    {
+        std::cout << "Min X: " << limits.getMinX().value()
+                  << " Max X: " << limits.getMaxX().value()
+                  << " Min Y: " << limits.getMinY().value()
+                  << " Max Y: " << limits.getMaxY().value()
+                  << std::endl;
+    }
+}
 
 void imuCb(const gz::msgs::IMU &_msg)
 {
     const auto &orientation = _msg.orientation();
-
+/*
     std::cout
         << "Orientation: "
         << "x=" << orientation.x()
@@ -54,6 +75,7 @@ void imuCb(const gz::msgs::IMU &_msg)
         << " y=" << linearAcceleration.y()
         << " z=" << linearAcceleration.z()
         << std::endl;
+*/
 }
 
 
@@ -64,9 +86,42 @@ void cb(const gz::msgs::LaserScan &_msg)
   gz::msgs::Twist data;
 
   bool allMore = true;
-  for (int i = 0; i < _msg.ranges_size(); i++)
+  int numRanges = _msg.ranges_size();
+  int steps = numRanges / 2;
+
+  double angleMin = _msg.angle_min();
+  double angleMax = _msg.angle_max();
+  double angleStep = _msg.angle_step();
+
+  double angleMinDeg = angleMin * 180.0 / M_PI;
+  double angleMaxDeg = angleMax * 180.0 / M_PI;
+
+  for (int i = 0; i < steps; i++)
   {
-    if (_msg.ranges(i) < 1.0)
+    float frontAngle = _msg.angle_min() + i * _msg.angle_step();
+    float degrees = frontAngle * 180.0 / M_PI;
+    float backAngle = frontAngle + M_PI;
+
+    double frontRange = _msg.ranges(i);
+    double backRange = _msg.ranges(i + steps);
+
+    double frontX = frontRange * cos(frontAngle);
+    double backX = backRange * cos(backAngle);
+    double frontY = frontRange * sin(frontAngle);
+    double backY = backRange * sin(backAngle);
+
+    std::cout << "Angle: " << degrees
+              << " Front Range: " << frontRange
+              << " Back Range: " << backRange
+              << " Front X: " << frontX
+              << " Back X: " << backX
+              << " Front Y: " << frontY
+              << " Back Y: " << backY
+              << " Width: " << (frontX + backX)
+              << " Height: " << (frontY + backY)
+              << std::endl;
+
+    if (frontRange < 1.0 || backRange < 1.0)
     {
       allMore = false;
       break;
@@ -104,6 +159,14 @@ int main(int argc, char **argv)
                 << topic_imu << "]" << std::endl;
         return -1;
     }
+
+  if (!node.Subscribe("/odom", odomCb))
+  {
+      std::cerr << "Failed to subscribe to /odom\n";
+      return 1;
+  }
+
+  std::cout << "Listening for odometry...\n";
 
   // Zzzzzz.
   gz::transport::waitForShutdown();
