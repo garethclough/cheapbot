@@ -15,6 +15,5 @@ install_manifest.txt
 *.out
 
 # Editor / OS files
-.vscode/
 .idea/
 .DS_Store
