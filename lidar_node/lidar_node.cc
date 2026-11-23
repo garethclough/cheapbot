@@ -3,6 +3,7 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/imu.pb.h>
 #include <gz/msgs/odometry.pb.h>
+#include <gz/msgs/pose_v.pb.h>
 #include <cmath>
 #include <thread>
 #include <chrono>
@@ -10,11 +11,16 @@
 #include <atomic>
 #include <csignal>
 #include <algorithm>
+#include <functional>
+#include <map>
+#include <sstream>
+#include <json/json.h>
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <diagnostic_msgs/srv/add_diagnostics.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include "min_max_xy.hh"
@@ -25,6 +31,8 @@ void handleInterrupt(int signal);
 void setUpGuiCommunication();
 void resetMode();
 std::string radiansToDegreesString(double radians);
+
+const double LIDAR_OFFSET_X = 1.3;
 
 struct Coordinate {
     double x;
@@ -56,6 +64,23 @@ enum class RoomScanMode
     WAIT_FOR_TURN = 4,
 };
 
+enum class PoseSource
+{
+    SENSORS = 0,
+    WORLD = 1
+};
+
+struct Topics
+{
+  std::string cmd_vel = "/cmd_vel";
+  std::string lidar = "/lidar";
+  std::string imu = "/imu";
+  std::string odom = "/odom";
+  // True poses of everything that moves, published by Gazebo (~60 Hz).
+  // "car_world" is the world name in building_robot.sdf.
+  std::string world_pose = "/world/car_world/dynamic_pose/info";
+};
+
 // Must come after RoomScanMode, which it uses.
 struct RoomScan {
   RoomScanMode mode = RoomScanMode::INIT;
@@ -73,10 +98,9 @@ struct RoomScan {
     return angle;
   }
 };
-
-std::string topic_pub = "/cmd_vel";   //publish to this topic
+Topics topics;
 gz::transport::Node node;
-auto pub = node.Advertise<gz::msgs::Twist>(topic_pub);
+auto pub = node.Advertise<gz::msgs::Twist>(topics.cmd_vel);
 std::optional<float> maxX;
 MinMaxXY limits;
 Mode mode = Mode::STOP;
@@ -87,14 +111,21 @@ std::atomic<bool> running{true};
 std::vector<Coordinate> coordinates;
 RoomScan roomScan;
 std::optional<double> lastPublishedYaw;
+bool useSensorsForYaw = true;   // if false, use /world/pose instead of /odom for heading
 
 float worldX = 0.0;
 float worldY = 0.0;
 
 // Robot heading in radians (-pi..pi, 0 = facing +x), from /odom.
 // Written by odomCb, read by loop(): both under dataMutex.
-double currentYaw = 0.0;
+double sensorYaw = 0.0;
 bool haveOdom = false;
+// The robot's true pose from Gazebo ("world sim" values), set by worldPoseCb.
+// Under dataMutex, like the odometry values.
+double worldPoseX = 0.0;
+double worldPoseY = 0.0;
+double worldPoseYaw = 0.0;
+bool haveWorldPose = false;
 // Odometry's own heading, before the offset is applied, and the offset
 // itself: the raw heading at the last reset. currentYaw = rawYaw - yawOffset,
 // so whichever way the robot faced at reset counts as 0.
@@ -124,22 +155,56 @@ void setSpeed(double linear, double angular)
   pub.Publish(cmd);
 }
 
+double getCurrentYaw() {
+  std::lock_guard<std::mutex> lock(dataMutex);
+  return useSensorsForYaw ? sensorYaw : worldPoseYaw;
+}
 
 // ROS 2 side, for talking to robot_gui.py. Separate from the Gazebo `node`
 // above. These must live as long as the program: if the service object is
 // destroyed, the service disappears.
 rclcpp::Node::SharedPtr rosNode;
-rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr resetService;
-// /robot/move_and_scan. Uses AddDiagnostics only because it's a standard
-// service type with a single string request and a success + message reply;
-// its `load_namespace` field carries the angle in degrees, as text.
-rclcpp::Service<diagnostic_msgs::srv::AddDiagnostics>::SharedPtr moveAndScanService;
+// /robot/command: every command from the GUI comes through this one service.
+// Uses AddDiagnostics only because it's a standard service type with a single
+// string request and a success + message reply; its `load_namespace` field
+// carries a JSON object such as {"cmd": "move_and_scan", "angle": 90}.
+rclcpp::Service<diagnostic_msgs::srv::AddDiagnostics>::SharedPtr commandService;
+// Where pose values should come from: "sensors" or "sim" (set by the GUI).
+// Stored only for now: nothing reads it yet.
+PoseSource poseSource = PoseSource::SENSORS;
 rclcpp::Publisher<std_msgs::msg::String>::SharedPtr logPublisher;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr coordinatesPublisher;
-rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr yawPublisher;
+// /robot/yaw: [sensor (odometry) yaw, world (Gazebo true) yaw], radians.
+// The world yaw is NaN until Gazebo's pose has arrived.
+rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr yawPublisher;
 // Only publish the yaw when it has moved at least this much (0.5 degrees),
 // so a robot sitting still doesn't send the same value 50 times a second.
 constexpr double kYawPublishThreshold = 0.5 * M_PI / 180.0;
+// World yaw last sent on /robot/yaw (the sensor one is lastPublishedYaw).
+std::optional<double> lastPublishedWorldYaw;
+
+// Send [sensor yaw, world yaw] on /robot/yaw.
+// Call with dataMutex held.
+void publishYaws()
+{
+  if (!yawPublisher)
+    return;
+  std_msgs::msg::Float64MultiArray yawMsg;
+  yawMsg.data.push_back(sensorYaw);
+  yawMsg.data.push_back(haveWorldPose ? worldPoseYaw : std::nan(""));
+  yawPublisher->publish(yawMsg);
+  lastPublishedYaw = sensorYaw;
+  if (haveWorldPose)
+    lastPublishedWorldYaw = worldPoseYaw;
+}
+
+// True if `yaw` has moved at least the threshold since `last` was sent
+// (or nothing has been sent yet).
+bool yawChanged(double yaw, const std::optional<double> &last)
+{
+  return !last.has_value() ||
+         std::fabs(normalizeAngle(yaw - last.value())) >= kYawPublishThreshold;
+}
 
 // Send a line of text on /robot/log. The publisher takes a std_msgs String
 // message, not a plain std::string, so wrap the text in one first.
@@ -151,78 +216,53 @@ void publishLog(const std::string &text)
   std::cout << text << std::endl;
 }
 
+// Heading (rotation about z, radians) from an orientation quaternion.
+double quatToYaw(const gz::msgs::Quaternion &q)
+{
+  return std::atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
+                    1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+}
+
 void odomCb(const gz::msgs::Odometry &msg)
 {
   // Heading from the orientation quaternion (rotation about z).
   const auto &q = msg.pose().orientation();
-
-  double odomYaw = std::atan2(
-    2.0 * (q.w() * q.z() + q.x() * q.y()),
-    1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z())
-);
-
   std::lock_guard<std::mutex> lock(dataMutex);
-  currentYaw = odomYaw;
+  sensorYaw = quatToYaw(q);
   haveOdom = true;
 
   // Publish when it has changed enough (or for the very first reading).
-  if (yawPublisher &&
-      (!lastPublishedYaw.has_value() ||
-       std::fabs(odomYaw - lastPublishedYaw.value()) >= kYawPublishThreshold))
-  {
-    std_msgs::msg::Float64 yawMsg;
-    yawMsg.data = odomYaw;
-    yawPublisher->publish(yawMsg);
-    lastPublishedYaw = odomYaw;
-  }
-  return;
-  /*
-    const auto &pose = msg.pose();
+  if (yawChanged(sensorYaw, lastPublishedYaw))
+    publishYaws();
+}
 
-    if (limits.update(
-        pose.position().x(),
-        pose.position().y()))
+
+
+// Gazebo publishes the pose of every model in the world as one Pose_V
+// message; pick out our robot's.
+void worldPoseCb(const gz::msgs::Pose_V &msg)
+{
+  std::lock_guard<std::mutex> lock(dataMutex);
+  for (const gz::msgs::Pose &pose : msg.pose())
+  {
+    if (pose.name() == "vehicle_blue")
     {
-        std::cout << "Min X: " << limits.getMinX().value()
-                  << " Max X: " << limits.getMaxX().value()
-                  << " Min Y: " << limits.getMinY().value()
-                  << " Max Y: " << limits.getMaxY().value()
-                  << std::endl;
+      worldPoseX = pose.position().x();
+      worldPoseY = pose.position().y();
+      worldPoseYaw = quatToYaw(pose.orientation());
+      haveWorldPose = true;
+      // Publish when the true heading has changed enough.
+      if (yawChanged(worldPoseYaw, lastPublishedWorldYaw))
+        publishYaws();
+      return;
     }
-                  */
+  }
 }
 
 void imuCb(const gz::msgs::IMU &_msg)
 {
   return;
     const auto &orientation = _msg.orientation();
-/*
-    std::cout
-        << "Orientation: "
-        << "x=" << orientation.x()
-        << " y=" << orientation.y()
-        << " z=" << orientation.z()
-        << " w=" << orientation.w()
-        << std::endl;
-
-    const auto &angularVelocity = _msg.angular_velocity();
-
-    std::cout
-        << "Angular velocity: "
-        << "x=" << angularVelocity.x()
-        << " y=" << angularVelocity.y()
-        << " z=" << angularVelocity.z()
-        << std::endl;
-
-    const auto &linearAcceleration = _msg.linear_acceleration();
-
-    std::cout
-        << "Acceleration: "
-        << "x=" << linearAcceleration.x()
-        << " y=" << linearAcceleration.y()
-        << " z=" << linearAcceleration.z()
-        << std::endl;
-*/
 }
 
 void lidarCb(const gz::msgs::LaserScan &_msg)
@@ -316,26 +356,30 @@ int main(int argc, char **argv)
 
   std::signal(SIGINT, handleInterrupt);   // Ctrl+C
   std::signal(SIGTERM, handleInterrupt);  // kill / pkill
-  std::string topic_lidar = "/lidar";   // subscribe to this topic
   // Subscribe to a topic by registering a callback.
-  if (!node.Subscribe(topic_lidar, lidarCb))
+  if (!node.Subscribe(topics.lidar, lidarCb))
   {
-    std::cerr << "Error subscribing to topic [" << topic_lidar << "]" << std::endl;
+    std::cerr << "Error subscribing to topic [" << topics.lidar << "]" << std::endl;
     return -1;
   }
 
-    std::string topic_imu = "/imu";
-
-    if (!node.Subscribe(topic_imu, imuCb))
+    if (!node.Subscribe(topics.imu, imuCb))
     {
         std::cerr << "Error subscribing to topic ["
-                << topic_imu << "]" << std::endl;
+                << topics.imu << "]" << std::endl;
         return -1;
     }
 
-  if (!node.Subscribe("/odom", odomCb))
+  if (!node.Subscribe(topics.odom, odomCb))
   {
-      std::cerr << "Failed to subscribe to /odom\n";
+      std::cerr << "Failed to subscribe to " << topics.odom << "\n";
+      return 1;
+  }
+
+
+  if (!node.Subscribe(topics.world_pose, worldPoseCb))
+  {
+      std::cerr << "Failed to subscribe to " << topics.world_pose << "\n";
       return 1;
   }
 
@@ -358,9 +402,9 @@ int main(int argc, char **argv)
   std::cout << "Shutting down..." << std::endl;
 
   // 1. Stop listening, so no more callbacks run.
-  node.Unsubscribe(topic_lidar);
-  node.Unsubscribe(topic_imu);
-  node.Unsubscribe("/odom");
+  node.Unsubscribe(topics.lidar);
+  node.Unsubscribe(topics.imu);
+  node.Unsubscribe(topics.odom);
 
   // 2. Stop the robot. The diff-drive plugin keeps using the last command
   //    it received, so without this the robot carries on after we exit.
@@ -380,8 +424,7 @@ int main(int argc, char **argv)
   // Release the ROS objects now, while ROS can still clean them up. Left to
   // themselves, these globals are destroyed after ROS has been torn down at
   // program exit, which crashes.
-  resetService.reset();
-  moveAndScanService.reset();
+  commandService.reset();
   logPublisher.reset();
   coordinatesPublisher.reset();
   yawPublisher.reset();
@@ -395,71 +438,125 @@ void resetMode() {
   waitingForLidarData = false;
   // The direction the robot faces now becomes the new 0.
   yawOffset = rawYaw;
-  currentYaw = 0.0;
+  sensorYaw = 0.0;
+  worldPoseYaw = 0.0;
   coordinates.clear();
   setSpeed(0.0, 0.0);   // in case a reset arrives mid-turn
-  if (yawPublisher) {
-    std_msgs::msg::Float64 yawMsg;
-    yawMsg.data = currentYaw;
-    yawPublisher->publish(yawMsg);
+  publishYaws();
+}
+
+// ---------------------------------------------------------------- commands
+// One function per GUI command. Each gets the whole JSON request (for any
+// extra fields, like "angle"), fills in `message` for the reply, and returns
+// true if the command was accepted. They're called with dataMutex held.
+using CommandHandler = std::function<bool(const Json::Value &, std::string &)>;
+
+// {"cmd": "reset"}
+bool cmdReset(const Json::Value &, std::string &message)
+{
+  std::cout << "Resetting robot..." << std::endl;
+  resetMode();
+  message = "Robot reset";
+  return true;
+}
+
+// {"cmd": "start_scan"}: run the room scan from the beginning.
+bool cmdStartScan(const Json::Value &, std::string &message)
+{
+  if (mode == Mode::SCAN_ROOM) {
+    message = "Room scan already in progress";
+    return false;
   }
+  setSpeed(0.0, 0.0);   // in case a move & scan was mid-turn
+  roomScan.reset();
+  waitingForLidarData = false;
+  mode = Mode::SCAN_ROOM;
+  message = "Room scan started";
+  return true;
+}
+
+// {"cmd": "move_and_scan", "angle": 90}: turn to angle (degrees), take one
+// scan. Replies straight away; progress arrives on /robot/log.
+bool cmdMoveAndScan(const Json::Value &request, std::string &message)
+{
+  const Json::Value &angle = request["angle"];
+  if (!angle.isNumeric() || !std::isfinite(angle.asDouble())) {
+    message = "move_and_scan needs a number \"angle\" in degrees";
+    return false;
+  }
+  if (mode == Mode::SCAN_ROOM) {
+    message = "Busy: room scan in progress";
+    return false;
+  }
+  turnTargetYaw = normalizeAngle(angle.asDouble() * M_PI / 180.0);
+  moveAndScanStep = MoveAndScanStep::TURN;
+  mode = Mode::MOVE_AND_SCAN;
+  message = "Moving to " + radiansToDegreesString(turnTargetYaw) + " to scan";
+  return true;
+}
+
+// {"cmd": "pose_source", "value": "sensors" | "world"}
+bool cmdPoseSource(const Json::Value &request, std::string &message)
+{
+  const Json::Value &value = request["value"];
+  if (!value.isString() ||
+      (value.asString() != "sensors" && value.asString() != "world")) {
+    message = "pose_source needs \"value\": \"sensors\" or \"world\"";
+    return false;
+  }
+  poseSource = value.asString() == "sensors" ? PoseSource::SENSORS : PoseSource::WORLD;
+  message = "Pose source set to " + value.asString();
+  return true;
+}
+
+// Command name -> handler. To add a command, write a function above and add
+// a line here.
+const std::map<std::string, CommandHandler> commandHandlers = {
+  {"reset",         cmdReset},
+  {"start_scan",    cmdStartScan},
+  {"move_and_scan", cmdMoveAndScan},
+  {"pose_source",   cmdPoseSource},
+};
+
+// Parse the JSON, find the handler for "cmd", run it.
+bool handleCommand(const std::string &text, std::string &message)
+{
+  Json::Value request;
+  Json::CharReaderBuilder reader;
+  std::string parseErrors;
+  std::istringstream stream(text);
+  if (!Json::parseFromStream(reader, stream, &request, &parseErrors) ||
+      !request.isObject()) {
+    message = "Not a JSON object: " + text;
+    return false;
+  }
+
+  const Json::Value &cmd = request["cmd"];
+  if (!cmd.isString()) {
+    message = "Missing \"cmd\" in: " + text;
+    return false;
+  }
+  auto handler = commandHandlers.find(cmd.asString());
+  if (handler == commandHandlers.end()) {
+    message = "Unknown command: " + cmd.asString();
+    return false;
+  }
+
+  // Service callbacks run on the ROS thread, so lock like loop() does.
+  std::lock_guard<std::mutex> lock(dataMutex);
+  return handler->second(request, message);
 }
 
 void setUpGuiCommunication()
 {
-  resetService = rosNode->create_service<std_srvs::srv::Trigger>(
-      "/robot/reset",
-      [&](
-          const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
-          std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-      {
-          // Reset your robot variables
-           std::cout << "Resetting robot..." << std::endl;
-           // This runs on the ROS thread, so lock like loop() does.
-           std::lock_guard<std::mutex> lock(dataMutex);
-           resetMode();
-          response->success = true;
-          response->message = "Robot reset successfully";
-      }
-  );
-  // Turn to an angle and take one scan. Replies straight away (accepted or
-  // not); the work happens in loop(), with progress on /robot/log.
-  moveAndScanService = rosNode->create_service<diagnostic_msgs::srv::AddDiagnostics>(
-      "/robot/move_and_scan",
+  commandService = rosNode->create_service<diagnostic_msgs::srv::AddDiagnostics>(
+      "/robot/command",
       [](
           const std::shared_ptr<diagnostic_msgs::srv::AddDiagnostics::Request> request,
           std::shared_ptr<diagnostic_msgs::srv::AddDiagnostics::Response> response)
       {
-          const std::string &angleText = request->load_namespace;
-
-          // Text -> number. std::stod throws if there's no number at the start;
-          // `used` catches trailing junk like "90abc".
-          double degrees;
-          try {
-            size_t used = 0;
-            degrees = std::stod(angleText, &used);
-            if (used != angleText.size() || !std::isfinite(degrees))
-              throw std::invalid_argument("bad angle");
-          } catch (const std::exception &) {
-            response->success = false;
-            response->message = "Not a valid angle: '" + angleText + "'";
-            return;
-          }
-
-          // This runs on the ROS thread, so lock like loop() does.
-          std::lock_guard<std::mutex> lock(dataMutex);
-          if (mode == Mode::SCAN_ROOM) {
-            response->success = false;
-            response->message = "Busy: room scan in progress";
-            return;
-          }
-
-          turnTargetYaw = normalizeAngle(degrees * M_PI / 180.0);
-          moveAndScanStep = MoveAndScanStep::TURN;
-          mode = Mode::MOVE_AND_SCAN;
-          response->success = true;
-          response->message = "Moving to " + radiansToDegreesString(turnTargetYaw)
-                              + " to scan";
+          response->success = handleCommand(request->load_namespace,
+                                            response->message);
       }
   );
 
@@ -468,10 +565,10 @@ void setUpGuiCommunication()
   coordinatesPublisher =
     rosNode->create_publisher<sensor_msgs::msg::PointCloud2>("/robot/coordinates", 10);
 
-  // Robot heading (radians, -pi..pi), published by odomCb when it changes.
+  // [sensor yaw, world yaw] (radians, -pi..pi), published when either changes.
   // transient_local: keep the last value and hand it to subscribers that
   // join later, so a GUI started while the robot is still gets it at once.
-  yawPublisher = rosNode->create_publisher<std_msgs::msg::Float64>(
+  yawPublisher = rosNode->create_publisher<std_msgs::msg::Float64MultiArray>(
       "/robot/yaw", rclcpp::QoS(1).transient_local());
 
 }
@@ -511,6 +608,7 @@ void processLidarData(bool clearCoordinates = true) {
     coordinates.clear();
   }
   std_msgs::msg::String logMsg;
+  double currentYaw = getCurrentYaw();
   logMsg.data = "Current yaw in lidar calc: " + radiansToDegreesString(currentYaw);
   logPublisher->publish(logMsg);
   double angle = msg.angle_min();
@@ -520,7 +618,9 @@ void processLidarData(bool clearCoordinates = true) {
                 ", increment: " + radiansToDegreesString(msg.angle_step());
   logPublisher->publish(logMsg);
   std::vector<Coordinate> newCoordinates;
-    for (int i = 0; i < msg.ranges_size(); i++)
+  double lx = worldX + LIDAR_OFFSET_X * std::cos(currentYaw);   // lidar position in the world
+  double ly = worldY + LIDAR_OFFSET_X * std::sin(currentYaw);
+  for (int i = 0; i < msg.ranges_size(); i++)
     {
         double distance = msg.ranges(i);
 
@@ -535,15 +635,15 @@ void processLidarData(bool clearCoordinates = true) {
 
         Coordinate point;
 
-        point.x = distance * std::cos(angle);
-        point.y = distance * std::sin(angle);
+        point.x = lx + distance * std::cos(angle + currentYaw);
+        point.y = ly + distance * std::sin(angle + currentYaw);
 
         newCoordinates.push_back(point);
 
         angle += angleIncrement;
     }
 
-    rotateCoordinates(newCoordinates, (M_PI / 2.0) + currentYaw);
+//    rotateCoordinates(newCoordinates, currentYaw);
   coordinates.insert(
       coordinates.end(),
       newCoordinates.begin(),
@@ -578,6 +678,8 @@ void publishCoordinates() {
   std::cout << "Published " << coordinates.size() << " coordinates" << std::endl;
 }
 
+
+
 void scanRoomLoop() {
   switch (roomScan.mode)
   {
@@ -608,7 +710,7 @@ void scanRoomLoop() {
           publishLog("Turning to: " + radiansToDegreesString(turnTargetYaw) + " deg");
           break;
       case RoomScanMode::WAIT_FOR_TURN: {
-          double remaining = normalizeAngle(turnTargetYaw - currentYaw);
+          double remaining = normalizeAngle(turnTargetYaw - getCurrentYaw());
           if (std::fabs(remaining) < 0.01) {        // within ~2 degrees: done
             setSpeed(0.0, 0.0);
             waitingForLidarData = true;
@@ -620,7 +722,7 @@ void scanRoomLoop() {
             }
             std::cout << "Turn done, " << remaining * 180.0 / M_PI
                       << " deg from target" << std::endl;
-            publishLog(radiansToDegreesString(currentYaw) + " deg");
+            publishLog(radiansToDegreesString(getCurrentYaw()) + " deg");
           } else {
             // Slow down near the end so it doesn't overshoot: speed is
             // proportional to the angle left, capped at 0.5 rad/s, with a
@@ -651,7 +753,7 @@ void moveAndScanLoop() {
 
     case MoveAndScanStep::WAIT_FOR_TURN: {
       // Same turn control as the room scan.
-      double remaining = normalizeAngle(turnTargetYaw - currentYaw);
+      double remaining = normalizeAngle(turnTargetYaw - getCurrentYaw());
       if (std::fabs(remaining) < 0.01) {
         setSpeed(0.0, 0.0);
         waitingForLidarData = true;    // ask lidarCb for the next scan
@@ -669,7 +771,7 @@ void moveAndScanLoop() {
       if (!waitingForLidarData) {
         processLidarData(false);   // add to the existing map, don't clear it
         publishCoordinates();
-        publishLog("Move & scan done at " + radiansToDegreesString(currentYaw));
+        publishLog("Move & scan done at " + radiansToDegreesString(getCurrentYaw()));
         mode = Mode::STOP;
       }
       break;

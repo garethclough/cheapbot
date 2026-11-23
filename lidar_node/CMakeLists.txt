@@ -16,6 +16,9 @@ find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 
+# JSON parsing for /robot/command (apt package libjsoncpp-dev)
+find_package(jsoncpp REQUIRED)
+
 include_directories(${CMAKE_BINARY_DIR})
 
 if (EXISTS "${CMAKE_SOURCE_DIR}/lidar_node.cc")
@@ -26,5 +29,6 @@ if (EXISTS "${CMAKE_SOURCE_DIR}/lidar_node.cc")
     ${std_srvs_TARGETS}
     ${std_msgs_TARGETS}
     ${sensor_msgs_TARGETS}
-    ${diagnostic_msgs_TARGETS})
+    ${diagnostic_msgs_TARGETS}
+    JsonCpp::JsonCpp)
 endif()
