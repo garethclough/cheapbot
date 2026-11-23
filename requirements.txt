@@ -1,0 +1,10 @@
+# pip-installable dependencies for the Python scripts in this repo.
+# ROS 2 (rclpy, *_msgs, sensor_msgs_py) and Gazebo (gz.msgs10, gz.transport13)
+# Python bindings come from the system install (source /opt/ros/<distro>/setup.bash),
+# not from pip.
+
+PySide6==6.12.0      # robot_gui.py
+numpy==2.5.5         # used by sensor_msgs_py.point_cloud2
+PyYAML==6.0.4        # used by rclpy / launch
+matplotlib           # lidar_node/plot_lidar.py, move_and_scan.py
+Pillow               # move_and_scan.py

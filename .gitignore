@@ -17,3 +17,4 @@ install_manifest.txt
 # Editor / OS files
 .idea/
 .DS_Store
+.venv
