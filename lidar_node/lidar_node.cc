@@ -155,8 +155,10 @@ void setSpeed(double linear, double angular)
   pub.Publish(cmd);
 }
 
+// Call with dataMutex held. It doesn't lock it itself: every caller runs
+// inside loop(), which already holds it, and locking a std::mutex twice from
+// the same thread deadlocks.
 double getCurrentYaw() {
-  std::lock_guard<std::mutex> lock(dataMutex);
   return useSensorsForYaw ? sensorYaw : worldPoseYaw;
 }
 
@@ -609,7 +611,7 @@ void processLidarData(bool clearCoordinates = true) {
   }
   std_msgs::msg::String logMsg;
   double currentYaw = getCurrentYaw();
-  logMsg.data = "Current yaw in lidar calc: " + radiansToDegreesString(currentYaw);
+  logMsg.data = "Current yaw in lidar calc: " + radiansToDegreesString(currentYaw) + " - World yaw: " + radiansToDegreesString(worldPoseYaw);
   logPublisher->publish(logMsg);
   double angle = msg.angle_min();
   double angleIncrement = msg.angle_step();
@@ -711,7 +713,7 @@ void scanRoomLoop() {
           break;
       case RoomScanMode::WAIT_FOR_TURN: {
           double remaining = normalizeAngle(turnTargetYaw - getCurrentYaw());
-          if (std::fabs(remaining) < 0.01) {        // within ~2 degrees: done
+          if (std::fabs(remaining) < 0.003) {        // within ~2 degrees: done
             setSpeed(0.0, 0.0);
             waitingForLidarData = true;
             if (roomScan.currentScan >= roomScan.numScans) {
