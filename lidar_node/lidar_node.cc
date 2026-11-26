@@ -23,8 +23,11 @@
 #include <std_msgs/msg/float64_multi_array.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include "coordinate.hh"
 #include "min_max_xy.hh"
 #include "lidar_message.hh"
+#include "ros2_comms.hh"
+#include "gazebo_comms.hh"
 
 void loop();
 void handleInterrupt(int signal);
@@ -33,11 +36,12 @@ void resetMode();
 std::string radiansToDegreesString(double radians);
 
 const double LIDAR_OFFSET_X = 1.3;
+Ros2Comms ros2Comms;
+GazeboComms gazeboComms;
+int coordinatesPublisherIndex;
+int logPublisherIndex;
+int yawPublisherIndex = -1;
 
-struct Coordinate {
-    double x;
-    double y;
-};
 
 enum class Mode
 {
@@ -84,7 +88,7 @@ struct Topics
 // Must come after RoomScanMode, which it uses.
 struct RoomScan {
   RoomScanMode mode = RoomScanMode::INIT;
-  const int numScans = 4;
+  const int numScans = 3;
   int currentScan = 0;
 
   void reset() {
@@ -99,8 +103,8 @@ struct RoomScan {
   }
 };
 Topics topics;
-gz::transport::Node node;
-auto pub = node.Advertise<gz::msgs::Twist>(topics.cmd_vel);
+//gz::transport::Node node;
+//auto pub = node.Advertise<gz::msgs::Twist>(topics.cmd_vel);
 std::optional<float> maxX;
 MinMaxXY limits;
 Mode mode = Mode::STOP;
@@ -111,7 +115,6 @@ std::atomic<bool> running{true};
 std::vector<Coordinate> coordinates;
 RoomScan roomScan;
 std::optional<double> lastPublishedYaw;
-bool useSensorsForYaw = true;   // if false, use /world/pose instead of /odom for heading
 
 float worldX = 0.0;
 float worldY = 0.0;
@@ -133,6 +136,8 @@ double rawYaw = 0.0;
 double yawOffset = 0.0;
 // Heading to stop at during WAIT_FOR_TURN.
 double turnTargetYaw = 0.0;
+PoseSource poseSource = PoseSource::SENSORS;
+
 // Current step while mode == MOVE_AND_SCAN.
 MoveAndScanStep moveAndScanStep = MoveAndScanStep::TURN;
 
@@ -149,23 +154,20 @@ void setSpeed(double linear, double angular)
   // arrive after the stop command and leave the robot driving.
   if (!running && (linear != 0.0 || angular != 0.0))
     return;
-  gz::msgs::Twist cmd;
-  cmd.mutable_linear()->set_x(linear);
-  cmd.mutable_angular()->set_z(angular);
-  pub.Publish(cmd);
+  gazeboComms.setSpeed(linear, angular);
 }
 
 // Call with dataMutex held. It doesn't lock it itself: every caller runs
 // inside loop(), which already holds it, and locking a std::mutex twice from
 // the same thread deadlocks.
 double getCurrentYaw() {
-  return useSensorsForYaw ? sensorYaw : worldPoseYaw;
+  return poseSource == PoseSource::SENSORS ? sensorYaw : worldPoseYaw;
 }
 
 // ROS 2 side, for talking to robot_gui.py. Separate from the Gazebo `node`
 // above. These must live as long as the program: if the service object is
 // destroyed, the service disappears.
-rclcpp::Node::SharedPtr rosNode;
+
 // /robot/command: every command from the GUI comes through this one service.
 // Uses AddDiagnostics only because it's a standard service type with a single
 // string request and a success + message reply; its `load_namespace` field
@@ -173,7 +175,7 @@ rclcpp::Node::SharedPtr rosNode;
 rclcpp::Service<diagnostic_msgs::srv::AddDiagnostics>::SharedPtr commandService;
 // Where pose values should come from: "sensors" or "sim" (set by the GUI).
 // Stored only for now: nothing reads it yet.
-PoseSource poseSource = PoseSource::SENSORS;
+
 rclcpp::Publisher<std_msgs::msg::String>::SharedPtr logPublisher;
 rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr coordinatesPublisher;
 // /robot/yaw: [sensor (odometry) yaw, world (Gazebo true) yaw], radians.
@@ -189,12 +191,12 @@ std::optional<double> lastPublishedWorldYaw;
 // Call with dataMutex held.
 void publishYaws()
 {
-  if (!yawPublisher)
-    return;
+  if (yawPublisherIndex < 0)
+    return;   // publisher not set up yet
   std_msgs::msg::Float64MultiArray yawMsg;
   yawMsg.data.push_back(sensorYaw);
   yawMsg.data.push_back(haveWorldPose ? worldPoseYaw : std::nan(""));
-  yawPublisher->publish(yawMsg);
+  ros2Comms.publish(yawPublisherIndex, yawMsg);
   lastPublishedYaw = sensorYaw;
   if (haveWorldPose)
     lastPublishedWorldYaw = worldPoseYaw;
@@ -214,7 +216,7 @@ void publishLog(const std::string &text)
 {
   std_msgs::msg::String msg;
   msg.data = text;
-  logPublisher->publish(msg);
+  ros2Comms.publish(logPublisherIndex, msg);
   std::cout << text << std::endl;
 }
 
@@ -340,60 +342,63 @@ void lidarCb(const gz::msgs::LaserScan &_msg)
     // arrive after the stop command and leave the robot driving.
     if (!running)
       return;
-    pub.Publish(data);
+    gazeboComms.setSpeed(data.linear().x(), data.angular().z());
   }
 }
 
 //////////////////////////////////////////////////
 int main(int argc, char **argv)
 {
-  // Start ROS 2 without its own Ctrl+C handler, so ours below stays in charge.
-  rclcpp::init(argc, argv, rclcpp::InitOptions(),
-               rclcpp::SignalHandlerOptions::None);
-  rosNode = rclcpp::Node::make_shared("lidar_node");
+  ros2Comms.init("lidar_node");
+  if (!gazeboComms.init(topics.cmd_vel))
+  {
+      std::cerr << "Failed to advertise " << topics.cmd_vel << "\n";
+      return 1;
+  }
   setUpGuiCommunication();
   // Handle ROS 2 requests (e.g. /robot/reset) on a background thread.
   // spin() returns when rclcpp::shutdown() is called during exit.
-  std::thread rosThread([] { rclcpp::spin(rosNode); });
+
 
   std::signal(SIGINT, handleInterrupt);   // Ctrl+C
   std::signal(SIGTERM, handleInterrupt);  // kill / pkill
   // Subscribe to a topic by registering a callback.
-  if (!node.Subscribe(topics.lidar, lidarCb))
+  if (!gazeboComms.subscribe(topics.lidar, lidarCb))
   {
     std::cerr << "Error subscribing to topic [" << topics.lidar << "]" << std::endl;
     return -1;
   }
 
-    if (!node.Subscribe(topics.imu, imuCb))
+    if (!gazeboComms.subscribe(topics.imu, imuCb))
     {
         std::cerr << "Error subscribing to topic ["
                 << topics.imu << "]" << std::endl;
         return -1;
     }
 
-  if (!node.Subscribe(topics.odom, odomCb))
+  if (!gazeboComms.subscribe(topics.odom, odomCb))
   {
       std::cerr << "Failed to subscribe to " << topics.odom << "\n";
       return 1;
   }
 
 
-  if (!node.Subscribe(topics.world_pose, worldPoseCb))
+  if (!gazeboComms.subscribe(topics.world_pose, worldPoseCb))
   {
       std::cerr << "Failed to subscribe to " << topics.world_pose << "\n";
       return 1;
   }
 
   std::cout << "Listening for odometry...\n";
-
-  // Zzzzzz.
-//  gz::transport::waitForShutdown();
   {
     // odomCb may already be running, so lock like the reset service does.
+    // The braces matter: the lock is released at the closing brace. Without
+    // them it's held for the rest of main(), and loop() and every callback
+    // that locks dataMutex wait forever.
     std::lock_guard<std::mutex> lock(dataMutex);
     resetMode();
   }
+
   while (running) {
       loop();
       // 20 times a second, so a turn is checked often enough to stop on time.
@@ -402,17 +407,13 @@ int main(int argc, char **argv)
 
   // ---- Shutdown: leave Gazebo in a clean state ----
   std::cout << "Shutting down..." << std::endl;
+  ros2Comms.shutdown();
 
-  // 1. Stop listening, so no more callbacks run.
-  node.Unsubscribe(topics.lidar);
-  node.Unsubscribe(topics.imu);
-  node.Unsubscribe(topics.odom);
+  gazeboComms.unsubscribeAll();
 
   // 2. Stop the robot. The diff-drive plugin keeps using the last command
   //    it received, so without this the robot carries on after we exit.
-  //    A Twist with nothing set is all zeros = stop.
-  gz::msgs::Twist stop;
-  pub.Publish(stop);
+  gazeboComms.stop();
 
   // 3. Publishing is asynchronous: give gz-transport a moment to actually
   //    send the message before the process (and its sockets) go away.
@@ -420,17 +421,6 @@ int main(int argc, char **argv)
 
   std::cout << "Robot stopped." << std::endl;
 
-  // 4. Stop ROS 2 and wait for its thread to finish.
-  rclcpp::shutdown();
-  rosThread.join();
-  // Release the ROS objects now, while ROS can still clean them up. Left to
-  // themselves, these globals are destroyed after ROS has been torn down at
-  // program exit, which crashes.
-  commandService.reset();
-  logPublisher.reset();
-  coordinatesPublisher.reset();
-  yawPublisher.reset();
-  rosNode.reset();
   return 0;
 }
 
@@ -551,26 +541,10 @@ bool handleCommand(const std::string &text, std::string &message)
 
 void setUpGuiCommunication()
 {
-  commandService = rosNode->create_service<diagnostic_msgs::srv::AddDiagnostics>(
-      "/robot/command",
-      [](
-          const std::shared_ptr<diagnostic_msgs::srv::AddDiagnostics::Request> request,
-          std::shared_ptr<diagnostic_msgs::srv::AddDiagnostics::Response> response)
-      {
-          response->success = handleCommand(request->load_namespace,
-                                            response->message);
-      }
-  );
-
-  logPublisher =
-    rosNode->create_publisher<std_msgs::msg::String>("/robot/log", 10);
-  coordinatesPublisher =
-    rosNode->create_publisher<sensor_msgs::msg::PointCloud2>("/robot/coordinates", 10);
-
-  // [sensor yaw, world yaw] (radians, -pi..pi), published when either changes.
-  // transient_local: keep the last value and hand it to subscribers that
-  // join later, so a GUI started while the robot is still gets it at once.
-  yawPublisher = rosNode->create_publisher<std_msgs::msg::Float64MultiArray>(
+  int commandServiceIndex = ros2Comms.addService("/robot/command", handleCommand);
+  logPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::String>("/robot/log");
+  coordinatesPublisherIndex = ros2Comms.addPublisher<sensor_msgs::msg::PointCloud2>("/robot/coordinates");
+  yawPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>(
       "/robot/yaw", rclcpp::QoS(1).transient_local());
 
 }
@@ -612,13 +586,13 @@ void processLidarData(bool clearCoordinates = true) {
   std_msgs::msg::String logMsg;
   double currentYaw = getCurrentYaw();
   logMsg.data = "Current yaw in lidar calc: " + radiansToDegreesString(currentYaw) + " - World yaw: " + radiansToDegreesString(worldPoseYaw);
-  logPublisher->publish(logMsg);
+  ros2Comms.publish(logPublisherIndex, logMsg);
   double angle = msg.angle_min();
   double angleIncrement = msg.angle_step();
   logMsg.data = "Lidar angle min: " + radiansToDegreesString(msg.angle_min()) +
                 ", max: " + radiansToDegreesString(msg.angle_max()) +
                 ", increment: " + radiansToDegreesString(msg.angle_step());
-  logPublisher->publish(logMsg);
+  ros2Comms.publish(logPublisherIndex, logMsg);
   std::vector<Coordinate> newCoordinates;
   double lx = worldX + LIDAR_OFFSET_X * std::cos(currentYaw);   // lidar position in the world
   double ly = worldY + LIDAR_OFFSET_X * std::sin(currentYaw);
@@ -656,27 +630,7 @@ void processLidarData(bool clearCoordinates = true) {
 // Publish every point in `coordinates` on /robot/coordinates as a point cloud
 // (x, y, z with z = 0), in the "world" frame.
 void publishCoordinates() {
-  sensor_msgs::msg::PointCloud2 cloud;
-  cloud.header.stamp = rosNode->now();
-  cloud.header.frame_id = "world";
-
-  // Describe the layout (three float fields: x, y, z) and size the buffer.
-  sensor_msgs::PointCloud2Modifier modifier(cloud);
-  modifier.setPointCloud2FieldsByString(1, "xyz");
-  modifier.resize(coordinates.size());
-
-  // Iterators step through the x, y and z fields of each point in turn.
-  sensor_msgs::PointCloud2Iterator<float> iterX(cloud, "x");
-  sensor_msgs::PointCloud2Iterator<float> iterY(cloud, "y");
-  sensor_msgs::PointCloud2Iterator<float> iterZ(cloud, "z");
-  for (const Coordinate &point : coordinates) {
-    *iterX = point.x;
-    *iterY = point.y;
-    *iterZ = 0.0f;
-    ++iterX; ++iterY; ++iterZ;
-  }
-
-  coordinatesPublisher->publish(cloud);
+  ros2Comms.publish2DCoordinates(coordinatesPublisherIndex, coordinates);
   std::cout << "Published " << coordinates.size() << " coordinates" << std::endl;
 }
 
