@@ -33,6 +33,65 @@ POSE_SOURCE_WORLD = "world"
 MAP_SIZE = 400      # bitmap width and height in pixels
 MAP_MARGIN = 20     # empty border around the points, in pixels
 
+# Colours for the two pose sources, used by the heading dial and the table.
+SENSORS_COLOUR = QColor(31, 119, 180)   # blue
+WORLD_COLOUR = QColor(40, 160, 40)      # green
+
+
+class HeadingDial(QWidget):
+    """A small compass showing the sensor and world headings as arrows.
+
+    Same directions as the map: 0 = pointing right (+x), angles increase
+    anticlockwise, so 90 degrees points up (+y).
+    """
+
+    SIZE = 90
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.sensor_yaw = math.nan   # radians; NaN = unknown, no arrow
+        self.world_yaw = math.nan
+
+    def set_yaws(self, sensor_yaw, world_yaw):
+        self.sensor_yaw = sensor_yaw
+        self.world_yaw = world_yaw
+        self.update()   # ask Qt to repaint
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        centre = QPointF(self.SIZE / 2, self.SIZE / 2)
+        radius = self.SIZE / 2 - 4
+
+        # Dial: circle, and ticks every 90 degrees.
+        painter.setPen(QPen(QColor(180, 180, 180), 1))
+        painter.setBrush(QColor("white"))
+        painter.drawEllipse(centre, radius, radius)
+        for i in range(4):
+            a = i * math.pi / 2
+            d = QPointF(math.cos(a), -math.sin(a))
+            painter.drawLine(centre + d * (radius - 6), centre + d * radius)
+
+        # World first, so the sensor arrow is drawn on top when they overlap.
+        self.draw_arrow(painter, centre, radius - 8, self.world_yaw, WORLD_COLOUR)
+        self.draw_arrow(painter, centre, radius - 8, self.sensor_yaw, SENSORS_COLOUR)
+        painter.end()
+
+    @staticmethod
+    def draw_arrow(painter, centre, length, yaw, colour):
+        if math.isnan(yaw):
+            return
+        # Pixel y points down, so flip the sine to make positive angles go up.
+        d = QPointF(math.cos(yaw), -math.sin(yaw))
+        tip = centre + d * length
+        painter.setPen(QPen(colour, 3, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(centre, tip)
+        # Arrow head: two short lines angled back from the tip.
+        for side in (+1, -1):
+            a = yaw + math.pi + side * math.radians(25)
+            painter.drawLine(tip, tip + QPointF(math.cos(a), -math.sin(a)) * 10)
+
 
 class RobotGUI(QWidget):
 
@@ -78,8 +137,13 @@ class RobotGUI(QWidget):
             self.pose_grid.addWidget(QLabel(heading), 0, col, Qt.AlignRight)
         # pose_labels["sensors"] = [x label, y label, yaw label], same for "world"
         self.pose_labels = {}
-        for row, (key, name) in enumerate([("sensors", "Sensors"), ("world", "World")], start=1):
-            self.pose_grid.addWidget(QLabel(name), row, 0)
+        for row, (key, name, colour) in enumerate(
+                [("sensors", "Sensors", SENSORS_COLOUR), ("world", "World", WORLD_COLOUR)],
+                start=1):
+            # Row name in the same colour as its arrow on the heading dial.
+            name_label = QLabel(name)
+            name_label.setStyleSheet(f"color: {colour.name()}; font-weight: bold;")
+            self.pose_grid.addWidget(name_label, row, 0)
             self.pose_labels[key] = []
             for col in range(1, 4):
                 label = QLabel("--")
@@ -88,6 +152,8 @@ class RobotGUI(QWidget):
                 self.pose_grid.addWidget(label, row, col)
                 self.pose_labels[key].append(label)
         self.pose_grid.setColumnStretch(4, 1)   # keep the table to the left
+
+        self.heading_dial = HeadingDial()
 
         # Pose source: one of two radio buttons, sensors selected to start.
         self.sensors_radio = QRadioButton("Sensors")
@@ -136,7 +202,10 @@ class RobotGUI(QWidget):
         source_row.addStretch()
         layout.addLayout(source_row)
 
-        layout.addLayout(self.pose_grid)
+        pose_row = QHBoxLayout()
+        pose_row.addLayout(self.pose_grid)
+        pose_row.addWidget(self.heading_dial)
+        layout.addLayout(pose_row)
 
         angle_row = QHBoxLayout()
         angle_row.addWidget(QLabel("Angle:"))
@@ -240,6 +309,8 @@ class RobotGUI(QWidget):
             labels[0].setText(fmt_metres(x))
             labels[1].setText(fmt_metres(y))
             labels[2].setText(fmt_degrees(yaw))
+
+        self.heading_dial.set_yaws(sensor_yaw=msg.data[2], world_yaw=msg.data[5])
 
     # ------------------------------------------------------------ map
 
