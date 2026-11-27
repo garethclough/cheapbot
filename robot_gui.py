@@ -44,6 +44,7 @@ CORNER_COLOUR = QColor(150, 60, 190)  # purple
 # Colours for the two pose sources, used by the heading dial and the table.
 SENSORS_COLOUR = QColor(31, 119, 180)   # blue
 WORLD_COLOUR = QColor(40, 160, 40)      # green
+CORRECTED_COLOUR = QColor(200, 40, 40)  # red
 
 
 def side_lengths(corners):
@@ -78,10 +79,12 @@ class HeadingDial(QWidget):
         super().__init__()
         self.setFixedSize(self.SIZE, self.SIZE)
         self.sensor_yaw = math.nan   # radians; NaN = unknown, no arrow
+        self.corrected_yaw = math.nan
         self.world_yaw = math.nan
 
-    def set_yaws(self, sensor_yaw, world_yaw):
+    def set_yaws(self, sensor_yaw, corrected_yaw, world_yaw):
         self.sensor_yaw = sensor_yaw
+        self.corrected_yaw = corrected_yaw
         self.world_yaw = world_yaw
         self.update()   # ask Qt to repaint
 
@@ -100,9 +103,11 @@ class HeadingDial(QWidget):
             d = QPointF(math.cos(a), -math.sin(a))
             painter.drawLine(centre + d * (radius - 6), centre + d * radius)
 
-        # World first, so the sensor arrow is drawn on top when they overlap.
+        # World first, then sensors, then corrected on top: when they overlap
+        # the corrected arrow, the one the robot uses, stays visible.
         self.draw_arrow(painter, centre, radius - 8, self.world_yaw, WORLD_COLOUR)
         self.draw_arrow(painter, centre, radius - 8, self.sensor_yaw, SENSORS_COLOUR)
+        self.draw_arrow(painter, centre, radius - 8, self.corrected_yaw, CORRECTED_COLOUR)
         painter.end()
 
     @staticmethod
@@ -152,7 +157,8 @@ class RobotGUI(QWidget):
         # as we connect, even if the robot is sitting still.
         latest_only = QoSProfile(depth=1,
                                  durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        # /robot/pose is [sensor x, y, yaw, world x, y, yaw] (metres, radians);
+        # /robot/pose is [sensor x, y, yaw, corrected x, y, yaw, world x, y, yaw]
+        # (metres, radians);
         # the world values are NaN until the node has Gazebo's pose.
         self.pose_sub = ros_node.create_subscription(
             Float64MultiArray, POSE_TOPIC, self.on_pose, latest_only)
@@ -168,15 +174,19 @@ class RobotGUI(QWidget):
 
         # Pose table: one row per source, columns x, y, yaw.
         #            x        y        yaw
-        #   Sensors  0.00 m   0.00 m   0.0°
-        #   World    0.00 m   0.00 m   0.0°
+        #   Sensors    0.00 m   0.00 m   0.0°
+        #   Corrected  0.00 m   0.00 m   0.0°
+        #   World      0.00 m   0.00 m   0.0°
         self.pose_grid = QGridLayout()
         for col, heading in enumerate(["x", "y", "yaw"], start=1):
             self.pose_grid.addWidget(QLabel(heading), 0, col, Qt.AlignRight)
-        # pose_labels["sensors"] = [x label, y label, yaw label], same for "world"
+        # pose_labels["sensors"] = [x label, y label, yaw label], same for
+        # "corrected" and "world"
         self.pose_labels = {}
         for row, (key, name, colour) in enumerate(
-                [("sensors", "Sensors", SENSORS_COLOUR), ("world", "World", WORLD_COLOUR)],
+                [("sensors", "Sensors", SENSORS_COLOUR),
+                 ("corrected", "Corrected", CORRECTED_COLOUR),
+                 ("world", "World", WORLD_COLOUR)],
                 start=1):
             # Row name in the same colour as its arrow on the heading dial.
             name_label = QLabel(name)
@@ -332,9 +342,10 @@ class RobotGUI(QWidget):
 
     def on_pose(self, msg):
         # Runs inside spin_once (Qt thread), so it can update the labels directly.
-        # msg.data = [sensor x, y, yaw, world x, y, yaw]: metres and radians.
-        if len(msg.data) < 6:
-            return   # old message format (yaw only), ignore
+        # msg.data = [sensor x, y, yaw, corrected x, y, yaw, world x, y, yaw]:
+        # metres and radians.
+        if len(msg.data) < 9:
+            return   # older message format, ignore
 
         def fmt_metres(m):
             return "--" if math.isnan(m) else f"{m:.2f} m"
@@ -342,14 +353,15 @@ class RobotGUI(QWidget):
         def fmt_degrees(radians):
             return "--" if math.isnan(radians) else f"{math.degrees(radians):.1f}°"
 
-        for key, start in (("sensors", 0), ("world", 3)):
+        for key, start in (("sensors", 0), ("corrected", 3), ("world", 6)):
             x, y, yaw = msg.data[start:start + 3]
             labels = self.pose_labels[key]
             labels[0].setText(fmt_metres(x))
             labels[1].setText(fmt_metres(y))
             labels[2].setText(fmt_degrees(yaw))
 
-        self.heading_dial.set_yaws(sensor_yaw=msg.data[2], world_yaw=msg.data[5])
+        self.heading_dial.set_yaws(sensor_yaw=msg.data[2], corrected_yaw=msg.data[5],
+                                   world_yaw=msg.data[8])
 
     # ------------------------------------------------------------ map
 

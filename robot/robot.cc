@@ -30,6 +30,7 @@
 #include "ros2_comms.hh"
 #include "gazebo_comms.hh"
 #include "map.hh"
+#include "scan.hh"
 
 void loop();
 void handleInterrupt(int signal);
@@ -125,17 +126,14 @@ std::optional<Pose> lastPublishedPose;
 float worldX = 0.0;
 float worldY = 0.0;
 
-// Robot pose from /odom (position + heading in radians, -pi..pi,
-// 0 = facing +x). Written by odomCb, read by loop(): both under dataMutex.
 Pose sensorPose;
 bool haveOdom = false;
 // The robot's true pose from Gazebo ("world sim" values), set by worldPoseCb.
-// Under dataMutex, like the odometry values.
 Pose worldPose;
+Pose correctedPose;
+Pose mapToOdom; // offset
 bool haveWorldPose = false;
-// Odometry's own heading, before the offset is applied, and the offset
-// itself: the raw heading at the last reset. currentYaw = rawYaw - yawOffset,
-// so whichever way the robot faced at reset counts as 0.
+
 double rawYaw = 0.0;
 double yawOffset = 0.0;
 // Heading to stop at during WAIT_FOR_TURN.
@@ -165,16 +163,16 @@ void setSpeed(double linear, double angular)
 // inside loop(), which already holds it, and locking a std::mutex twice from
 // the same thread deadlocks.
 double getCurrentYaw() {
-  return poseSource == PoseSource::SENSORS ? sensorPose.yaw : worldPose.yaw;
+  return poseSource == PoseSource::SENSORS ? correctedPose.yaw : worldPose.yaw;
 }
 
 // Robot position (model origin, metres) from the selected pose source.
 double getCurrentX() {
-  return poseSource == PoseSource::SENSORS ? sensorPose.position.x : worldPose.position.x;
+  return poseSource == PoseSource::SENSORS ? correctedPose.position.x : worldPose.position.x;
 }
 
 double getCurrentY() {
-  return poseSource == PoseSource::SENSORS ? sensorPose.position.y : worldPose.position.y;
+  return poseSource == PoseSource::SENSORS ? correctedPose.position.y : worldPose.position.y;
 }
 
 // Only publish when the pose has changed at least this much (0.5 degrees
@@ -198,6 +196,9 @@ void publishPose()
     sensorPose.position.x,
     sensorPose.position.y,
     sensorPose.yaw,
+    correctedPose.position.x,
+    correctedPose.position.y,
+    correctedPose.yaw,
     haveWorldPose ? worldPose.position.x : unknown,
     haveWorldPose ? worldPose.position.y : unknown,
     haveWorldPose ? worldPose.yaw : unknown,
@@ -247,8 +248,19 @@ void odomCb(const gz::msgs::Odometry &msg)
   sensorPose.position.y = msg.pose().position().y();
   haveOdom = true;
 
+  correctedPose.yaw = normalizeAngle(sensorPose.yaw + mapToOdom.yaw);
+  correctedPose.position.x =
+      mapToOdom.position.x +
+      cos(mapToOdom.yaw) * sensorPose.position.x -
+      sin(mapToOdom.yaw) * sensorPose.position.y;
+
+  correctedPose.position.y =
+      mapToOdom.position.y +
+      sin(mapToOdom.yaw) * sensorPose.position.x +
+      cos(mapToOdom.yaw) * sensorPose.position.y;
+
   // Publish when it has changed enough (or for the very first reading).
-  if (poseChanged(sensorPose, lastPublishedPose))
+  if (poseChanged(correctedPose, lastPublishedPose))
     publishPose();
 }
 
@@ -535,6 +547,7 @@ void processLidarData(bool clearCoordinates = true) {
   if (clearCoordinates) {
     map.clear();
   }
+  Scan scan;
   std_msgs::msg::String logMsg;
   double currentYaw = getCurrentYaw();
   logMsg.data = "Current yaw in lidar calc: " + radiansToDegreesString(currentYaw) + " - World yaw: " + radiansToDegreesString(worldPose.yaw);
@@ -562,16 +575,21 @@ void processLidarData(bool clearCoordinates = true) {
         }
 
         Coordinate point;
+        Coordinate worldPoint;
 
-        point.x = lx + distance * std::cos(angle + currentYaw);
-        point.y = ly + distance * std::sin(angle + currentYaw);
+        point.x = distance * std::cos(angle);
+        point.y = distance * std::sin(angle);
 
-        newCoordinates.push_back(point);
+        worldPoint.x = lx + distance * std::cos(angle + currentYaw);
+        worldPoint.y = ly + distance * std::sin(angle + currentYaw);
+
+        scan.localPoints.push_back(point);
+        scan.worldPoints.push_back(worldPoint);
 
         angle += angleIncrement;
     }
 
-  map.insert(newCoordinates);
+  map.addScan(scan);
   map.update();
 }
 

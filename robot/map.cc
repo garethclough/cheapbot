@@ -3,6 +3,7 @@
 #include "wall.hh"
 #include "corner.hh"
 #include "room_metrics.hh"
+#include "scan.hh"
 
 #include <iostream>
 #include <vector>
@@ -20,6 +21,10 @@ struct Config {
 };
 
 Config config;
+
+void Map::addScan(Scan scan) {
+    scans.push_back(scan);
+}
 
 // Fit a line using Total Least Squares
 // Returns normalised coefficients a, b, c
@@ -417,6 +422,15 @@ RoomMetrics calculateRoomSize(
 
 
 void Map::update() {
+    std::vector<Coordinate> coordinates;
+    for (const auto& scan : scans) {
+        coordinates.insert(
+            coordinates.end(),
+            scan.worldPoints.begin(),
+            scan.worldPoints.end()
+        );
+    }
+
     walls = detectWalls(coordinates);
 
     // Detect corners
@@ -446,7 +460,15 @@ void Map::update() {
 MapMessage Map::getMessage() const {
     MapMessage message;
     message.walls = walls;
-    message.coordinates = coordinates;
+    message.coordinates.clear();
+
+    for (const auto& scan : scans) {
+        message.coordinates.insert(
+            message.coordinates.end(),
+            scan.worldPoints.begin(),
+            scan.worldPoints.end()
+        );
+    }
     message.corners = corners;
     message.room = room;
     return message;
