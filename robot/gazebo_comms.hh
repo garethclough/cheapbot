@@ -6,7 +6,7 @@
 #include <gz/transport/Node.hh>
 #include <gz/msgs/twist.pb.h>
 
-// The Gazebo side of lidar_node, for talking to the simulator.
+// The Gazebo side of the robot program, for talking to the simulator.
 class GazeboComms
 {
 public:

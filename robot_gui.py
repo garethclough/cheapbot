@@ -20,7 +20,7 @@ from std_msgs.msg import String, Float64MultiArray
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
 
-# Every command to lidar_node goes through this one service.
+# Every command to the robot program goes through this one service.
 COMMAND_SERVICE = "/robot/command"
 COORDINATES_TOPIC = "/robot/coordinates"
 LOG_TOPIC = "/robot/log"
@@ -41,7 +41,7 @@ class RobotGUI(QWidget):
 
         self.ros_node = ros_node
         self.command_client = ros_node.create_client(Command, COMMAND_SERVICE)
-        # Used to notice lidar_node (re)appearing, so the pose source can be
+        # Used to notice the robot program (re)appearing, so the pose source can be
         # sent to it again.
         self.node_was_available = False
 
@@ -150,7 +150,7 @@ class RobotGUI(QWidget):
         self.map_timer.timeout.connect(self.check_for_new_coordinates)
         self.map_timer.start(1000)
 
-        # Once a second, check whether lidar_node has (re)appeared; when it
+        # Once a second, check whether the robot program has (re)appeared; when it
         # does, send it the current pose source so the two agree.
         self.node_timer = QTimer(self)
         self.node_timer.timeout.connect(self.check_node_available)
@@ -161,14 +161,14 @@ class RobotGUI(QWidget):
     # ------------------------------------------------------------ commands
 
     def send_command(self, command, label):
-        """Send a command dict to lidar_node as JSON; log the reply.
+        """Send a command dict to the robot program as JSON; log the reply.
 
         command: e.g. {"cmd": "move_and_scan", "angle": 90}
         label:   name to show in the log, e.g. "Move & scan"
         """
         if not self.command_client.service_is_ready():
             self.log(f"{label} failed: {COMMAND_SERVICE} not available "
-                     "(is lidar_node running?)")
+                     "(is robot running?)")
             return
 
         request = Command.Request()
@@ -198,7 +198,7 @@ class RobotGUI(QWidget):
     def check_node_available(self):
         available = self.command_client.service_is_ready()
         if available and not self.node_was_available:
-            self.log("lidar_node connected")
+            self.log("robot connected")
             self.set_pose_source(self.current_pose_source())
         self.node_was_available = available
 

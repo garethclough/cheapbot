@@ -21,9 +21,9 @@ find_package(jsoncpp REQUIRED)
 
 include_directories(${CMAKE_BINARY_DIR})
 
-if (EXISTS "${CMAKE_SOURCE_DIR}/lidar_node.cc")
-  add_executable(lidar_node lidar_node.cc min_max_xy.cc ros2_comms.cc gazebo_comms.cc)
-  target_link_libraries(lidar_node
+if (EXISTS "${CMAKE_SOURCE_DIR}/robot.cc")
+  add_executable(robot robot.cc min_max_xy.cc ros2_comms.cc gazebo_comms.cc)
+  target_link_libraries(robot
     gz-transport::core
     rclcpp::rclcpp
     ${std_srvs_TARGETS}

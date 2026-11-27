@@ -122,8 +122,8 @@ gz topic -e -t /lidar
 export CMAKE_PREFIX_PATH="/opt/ros/jazzy/opt/gz_transport_vendor/extra_cmake:$CMAKE_PREFIX_PATH"
 
 # Build lidar node
-cmake --build lidar_node/build
-./lidar_node/build/lidar_node
+cmake --build robot/build
+./robot/build/robot
 
 # Run gui
 .venv/bin/python robot_gui.py

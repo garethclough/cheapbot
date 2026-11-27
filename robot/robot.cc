@@ -122,6 +122,9 @@ float worldY = 0.0;
 // Robot heading in radians (-pi..pi, 0 = facing +x), from /odom.
 // Written by odomCb, read by loop(): both under dataMutex.
 double sensorYaw = 0.0;
+// Robot position from /odom, set by odomCb (under dataMutex).
+double sensorX = 0.0;
+double sensorY = 0.0;
 bool haveOdom = false;
 // The robot's true pose from Gazebo ("world sim" values), set by worldPoseCb.
 // Under dataMutex, like the odometry values.
@@ -162,6 +165,15 @@ void setSpeed(double linear, double angular)
 // the same thread deadlocks.
 double getCurrentYaw() {
   return poseSource == PoseSource::SENSORS ? sensorYaw : worldPoseYaw;
+}
+
+// Robot position (model origin, metres) from the selected pose source.
+double getCurrentX() {
+  return poseSource == PoseSource::SENSORS ? sensorX : worldPoseX;
+}
+
+double getCurrentY() {
+  return poseSource == PoseSource::SENSORS ? sensorY : worldPoseY;
 }
 
 // ROS 2 side, for talking to robot_gui.py. Separate from the Gazebo `node`
@@ -233,6 +245,8 @@ void odomCb(const gz::msgs::Odometry &msg)
   const auto &q = msg.pose().orientation();
   std::lock_guard<std::mutex> lock(dataMutex);
   sensorYaw = quatToYaw(q);
+  sensorX = msg.pose().position().x();
+  sensorY = msg.pose().position().y();
   haveOdom = true;
 
   // Publish when it has changed enough (or for the very first reading).
@@ -280,76 +294,12 @@ void lidarCb(const gz::msgs::LaserScan &_msg)
 
   waitingForLidarData = false;
   return;
-
-  gz::msgs::Twist data;
-
-  bool allMore = true;
-  int numRanges = _msg.ranges_size();
-  int steps = numRanges / 2;
-
-  double angleMin = _msg.angle_min();
-  double angleMax = _msg.angle_max();
-  double angleStep = _msg.angle_step();
-
-  double angleMinDeg = angleMin * 180.0 / M_PI;
-  double angleMaxDeg = angleMax * 180.0 / M_PI;
-
-  for (int i = 0; i < steps; i++)
-  {
-    float frontAngle = _msg.angle_min() + i * _msg.angle_step();
-    float degrees = frontAngle * 180.0 / M_PI;
-    float backAngle = frontAngle + M_PI;
-
-    double frontRange = _msg.ranges(i);
-    double backRange = _msg.ranges(i + steps);
-
-    double frontX = frontRange * cos(frontAngle);
-    double backX = backRange * cos(backAngle);
-    double frontY = frontRange * sin(frontAngle);
-    double backY = backRange * sin(backAngle);
-
-    std::cout << "Angle: " << degrees
-              << " Front Range: " << frontRange
-              << " Back Range: " << backRange
-              << " Front X: " << frontX
-              << " Back X: " << backX
-              << " Front Y: " << frontY
-              << " Back Y: " << backY
-              << " Width: " << (frontX + backX)
-              << " Height: " << (frontY + backY)
-              << std::endl;
-
-    if (frontRange < 1.0 || backRange < 1.0)
-    {
-      allMore = false;
-      break;
-    }
-  }
-
-  if (mode == Mode::MOVE_FORWARD) {
-
-    if (allMore) //if all bigger than one
-    {
-      data.mutable_linear()->set_x(0.5);
-      data.mutable_angular()->set_z(0.0);
-    }
-    else
-    {
-      data.mutable_linear()->set_x(0.0);
-      data.mutable_angular()->set_z(0.5);
-    }
-    // Don't send a move command once shutdown has started, or it could
-    // arrive after the stop command and leave the robot driving.
-    if (!running)
-      return;
-    gazeboComms.setSpeed(data.linear().x(), data.angular().z());
-  }
 }
 
 //////////////////////////////////////////////////
 int main(int argc, char **argv)
 {
-  ros2Comms.init("lidar_node");
+  ros2Comms.init("robot");
   if (!gazeboComms.init(topics.cmd_vel))
   {
       std::cerr << "Failed to advertise " << topics.cmd_vel << "\n";
@@ -594,8 +544,8 @@ void processLidarData(bool clearCoordinates = true) {
                 ", increment: " + radiansToDegreesString(msg.angle_step());
   ros2Comms.publish(logPublisherIndex, logMsg);
   std::vector<Coordinate> newCoordinates;
-  double lx = worldX + LIDAR_OFFSET_X * std::cos(currentYaw);   // lidar position in the world
-  double ly = worldY + LIDAR_OFFSET_X * std::sin(currentYaw);
+  double lx = getCurrentX() + LIDAR_OFFSET_X * std::cos(currentYaw);   // lidar position in the world
+  double ly = getCurrentY() + LIDAR_OFFSET_X * std::sin(currentYaw);
   for (int i = 0; i < msg.ranges_size(); i++)
     {
         double distance = msg.ranges(i);

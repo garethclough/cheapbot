@@ -2,7 +2,7 @@
 """
 move_and_scan.py - turn the robot to a heading in Gazebo, then take a lidar scan.
 
-Talks to Gazebo directly (gz-transport), no lidar_node needed:
+Talks to Gazebo directly (gz-transport), no robot program needed:
   - reads the robot's heading from /odom
   - turns it with /cmd_vel until it faces the requested angle
   - waits for the robot to settle, then grabs one /lidar scan
@@ -21,7 +21,7 @@ with ROS sourced and the sim running (press play in Gazebo):
 Angles are the odometry heading in degrees: 0 = the direction the robot faced
 when the sim started, positive = anticlockwise (left).
 
-Don't run this while lidar_node is driving the robot: both would send
+Don't run this while the robot program is driving the robot: both would send
 /cmd_vel and fight over it.
 """
 
@@ -55,7 +55,7 @@ LIDAR_OFFSET_X = 1.3
 BITMAP_EXTENT = 6.0     # metres from the centre to each edge
 PIXELS_PER_METRE = 50   # 12 m * 50 = 600 x 600 pixels
 
-# Turn control, same as lidar_node: speed proportional to the angle left,
+# Turn control, same as the robot program: speed proportional to the angle left,
 # capped, with a minimum so it doesn't stall just short of the target.
 TOLERANCE = math.radians(0.5)   # stop when within this of the target
 MAX_TURN_SPEED = 0.5            # rad/s

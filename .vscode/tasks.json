@@ -1,35 +1,35 @@
 {
-  // Build tasks for lidar_node.
-  //   Ctrl+Shift+B                         -> "build lidar_node" (the default)
+  // Build tasks for the robot program (source in robot/).
+  //   Ctrl+Shift+B                         -> "build robot" (the default)
   //   Ctrl+Shift+P -> "Tasks: Run Task"    -> pick either task
   // Errors and warnings appear in the Problems panel (Ctrl+Shift+M);
   // click one to jump to the line.
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "build lidar_node",
+      "label": "build robot",
       "type": "shell",
-      "command": "source /opt/ros/jazzy/setup.bash && export CMAKE_PREFIX_PATH=/opt/ros/jazzy/opt/gz_transport_vendor/extra_cmake:$CMAKE_PREFIX_PATH && cmake -S lidar_node -B lidar_node/build -DCMAKE_BUILD_TYPE=Debug && cmake --build lidar_node/build -j",
+      "command": "source /opt/ros/jazzy/setup.bash && export CMAKE_PREFIX_PATH=/opt/ros/jazzy/opt/gz_transport_vendor/extra_cmake:$CMAKE_PREFIX_PATH && cmake -S robot -B robot/build -DCMAKE_BUILD_TYPE=Debug && cmake --build robot/build -j",
       "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
       "group": { "kind": "build", "isDefault": true },
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true, "showReuseMessage": false },
       "problemMatcher": {
         "base": "$gcc",
-        // g++ prints full paths (/home/.../lidar_node.cc:425:3: error: ...);
+        // g++ prints full paths (/home/.../robot.cc:425:3: error: ...);
         // autoDetect handles both full and relative paths.
-        "fileLocation": ["autoDetect", "${workspaceFolder}/lidar_node"]
+        "fileLocation": ["autoDetect", "${workspaceFolder}/robot"]
       }
     },
     {
-      "label": "rebuild lidar_node (clean)",
+      "label": "rebuild robot (clean)",
       "type": "shell",
-      "command": "source /opt/ros/jazzy/setup.bash && export CMAKE_PREFIX_PATH=/opt/ros/jazzy/opt/gz_transport_vendor/extra_cmake:$CMAKE_PREFIX_PATH && cmake -S lidar_node -B lidar_node/build -DCMAKE_BUILD_TYPE=Debug && cmake --build lidar_node/build -j --clean-first",
+      "command": "source /opt/ros/jazzy/setup.bash && export CMAKE_PREFIX_PATH=/opt/ros/jazzy/opt/gz_transport_vendor/extra_cmake:$CMAKE_PREFIX_PATH && cmake -S robot -B robot/build -DCMAKE_BUILD_TYPE=Debug && cmake --build robot/build -j --clean-first",
       "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "/bin/bash", "args": ["-c"] } },
       "group": "build",
       "presentation": { "reveal": "always", "panel": "dedicated", "clear": true, "showReuseMessage": false },
       "problemMatcher": {
         "base": "$gcc",
-        "fileLocation": ["autoDetect", "${workspaceFolder}/lidar_node"]
+        "fileLocation": ["autoDetect", "${workspaceFolder}/robot"]
       }
     }
   ]
