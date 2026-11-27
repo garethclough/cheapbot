@@ -46,6 +46,25 @@ SENSORS_COLOUR = QColor(31, 119, 180)   # blue
 WORLD_COLOUR = QColor(40, 160, 40)      # green
 
 
+def side_lengths(corners):
+    """Lengths of the room's sides, corner 1->2, 2->3, ..., last->1 (metres)."""
+    n = len(corners)
+    return [math.hypot(corners[(i + 1) % n][0] - corners[i][0],
+                       corners[(i + 1) % n][1] - corners[i][1])
+            for i in range(n)]
+
+
+def describe_dimensions(corners):
+    """'9.50 m × 9.50 m' for a four-cornered room (each pair of opposite
+    sides averaged), otherwise the list of side lengths."""
+    sides = side_lengths(corners)
+    if len(sides) == 4:
+        width = (sides[0] + sides[2]) / 2
+        length = (sides[1] + sides[3]) / 2
+        return f"{width:.2f} m × {length:.2f} m"
+    return "sides " + ", ".join(f"{side:.2f}" for side in sides) + " m"
+
+
 class HeadingDial(QWidget):
     """A small compass showing the sensor and world headings as arrows.
 
@@ -374,7 +393,8 @@ class RobotGUI(QWidget):
             self.latest_room = None
             if len(self.map_corners) >= 3:
                 self.room_info.setText(
-                    f"Room: area {area:.2f} m², perimeter {perimeter:.2f} m, "
+                    f"Room: {describe_dimensions(self.map_corners)}, "
+                    f"area {area:.2f} m², perimeter {perimeter:.2f} m, "
                     f"{len(self.map_corners)} corners")
             else:
                 self.room_info.setText(
@@ -427,6 +447,33 @@ class RobotGUI(QWidget):
             painter.drawEllipse(centre, 5, 5)
             painter.drawText(centre + QPointF(7, -7), str(number))
         painter.setBrush(Qt.NoBrush)
+
+        # Side lengths: written at the middle of each side, just inside the room.
+        if len(corners) >= 3:
+            # Which way round the corners go decides which side of each wall is
+            # inside: anticlockwise (positive area) = inside is on the left.
+            signed_area = sum(corners[i][0] * corners[(i + 1) % len(corners)][1]
+                              - corners[(i + 1) % len(corners)][0] * corners[i][1]
+                              for i in range(len(corners)))
+            inside = 1.0 if signed_area > 0 else -1.0
+            metrics = painter.fontMetrics()
+            painter.setPen(QPen(CORNER_COLOUR, 1))
+            for i, side in enumerate(side_lengths(corners)):
+                (x1, y1), (x2, y2) = corners[i], corners[(i + 1) % len(corners)]
+                if side < 1e-9:
+                    continue
+                # Unit vector at right angles to the wall, pointing into the room
+                # (world coordinates; y is flipped below for pixels).
+                nx = -(y2 - y1) / side * inside
+                ny = (x2 - x1) / side * inside
+                text = f"{side:.2f} m"
+                w, h = metrics.horizontalAdvance(text), metrics.ascent()
+                # Far enough in that the whole text clears the wall: half the
+                # text's width/height in the direction we move, plus a gap.
+                gap = 6 + abs(nx) * w / 2 + abs(ny) * h / 2
+                middle = to_pixel((x1 + x2) / 2, (y1 + y2) / 2)
+                centre = middle + QPointF(nx, -ny) * gap
+                painter.drawText(centre + QPointF(-w / 2, h / 2 - 1), text)
 
         # Origin: red cross.
         origin = to_pixel(0.0, 0.0)
