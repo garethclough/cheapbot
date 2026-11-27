@@ -22,7 +22,7 @@ find_package(jsoncpp REQUIRED)
 include_directories(${CMAKE_BINARY_DIR})
 
 if (EXISTS "${CMAKE_SOURCE_DIR}/robot.cc")
-  add_executable(robot robot.cc min_max_xy.cc ros2_comms.cc gazebo_comms.cc)
+  add_executable(robot robot.cc min_max_xy.cc ros2_comms.cc gazebo_comms.cc map.cc)
   target_link_libraries(robot
     gz-transport::core
     rclcpp::rclcpp

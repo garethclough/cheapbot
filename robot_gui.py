@@ -3,7 +3,7 @@ import math
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton,
     QTextEdit, QVBoxLayout, QHBoxLayout, QLabel, QDoubleSpinBox,
-    QRadioButton, QButtonGroup
+    QRadioButton, QButtonGroup, QGridLayout
 )
 from PySide6.QtCore import QTimer, Qt, QPointF
 from PySide6.QtGui import QPixmap, QPainter, QColor, QPen
@@ -24,7 +24,7 @@ from sensor_msgs_py import point_cloud2
 COMMAND_SERVICE = "/robot/command"
 COORDINATES_TOPIC = "/robot/coordinates"
 LOG_TOPIC = "/robot/log"
-YAW_TOPIC = "/robot/yaw"
+POSE_TOPIC = "/robot/pose"
 # Where the robot's position/heading should come from:
 # "sensors" = odometry and other robot sensors, "world" = Gazebo's true values.
 POSE_SOURCE_SENSORS = "sensors"
@@ -55,10 +55,10 @@ class RobotGUI(QWidget):
         # as we connect, even if the robot is sitting still.
         latest_only = QoSProfile(depth=1,
                                  durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        # /robot/yaw is [sensor yaw, world yaw] in radians; world is NaN until
-        # the node has Gazebo's pose.
-        self.yaw_sub = ros_node.create_subscription(
-            Float64MultiArray, YAW_TOPIC, self.on_yaw, latest_only)
+        # /robot/pose is [sensor x, y, yaw, world x, y, yaw] (metres, radians);
+        # the world values are NaN until the node has Gazebo's pose.
+        self.pose_sub = ros_node.create_subscription(
+            Float64MultiArray, POSE_TOPIC, self.on_pose, latest_only)
 
         self.setWindowTitle("Robot Controller")
         self.resize(500, 700)
@@ -69,8 +69,25 @@ class RobotGUI(QWidget):
         self.start_scan_button = QPushButton("Start Scan")
         self.start_scan_button.clicked.connect(self.start_scan)
 
-        self.yaw_label = QLabel("Yaw: --")
-        self.world_yaw_label = QLabel("World yaw: --")
+        # Pose table: one row per source, columns x, y, yaw.
+        #            x        y        yaw
+        #   Sensors  0.00 m   0.00 m   0.0°
+        #   World    0.00 m   0.00 m   0.0°
+        self.pose_grid = QGridLayout()
+        for col, heading in enumerate(["x", "y", "yaw"], start=1):
+            self.pose_grid.addWidget(QLabel(heading), 0, col, Qt.AlignRight)
+        # pose_labels["sensors"] = [x label, y label, yaw label], same for "world"
+        self.pose_labels = {}
+        for row, (key, name) in enumerate([("sensors", "Sensors"), ("world", "World")], start=1):
+            self.pose_grid.addWidget(QLabel(name), row, 0)
+            self.pose_labels[key] = []
+            for col in range(1, 4):
+                label = QLabel("--")
+                label.setMinimumWidth(70)
+                label.setAlignment(Qt.AlignRight)
+                self.pose_grid.addWidget(label, row, col)
+                self.pose_labels[key].append(label)
+        self.pose_grid.setColumnStretch(4, 1)   # keep the table to the left
 
         # Pose source: one of two radio buttons, sensors selected to start.
         self.sensors_radio = QRadioButton("Sensors")
@@ -119,12 +136,7 @@ class RobotGUI(QWidget):
         source_row.addStretch()
         layout.addLayout(source_row)
 
-        yaw_row = QHBoxLayout()
-        yaw_row.addWidget(self.yaw_label)
-        yaw_row.addSpacing(30)
-        yaw_row.addWidget(self.world_yaw_label)
-        yaw_row.addStretch()
-        layout.addLayout(yaw_row)
+        layout.addLayout(self.pose_grid)
 
         angle_row = QHBoxLayout()
         angle_row.addWidget(QLabel("Angle:"))
@@ -210,16 +222,24 @@ class RobotGUI(QWidget):
         # Runs inside spin_once. Just append the message to the text box.
         self.log(msg.data)
 
-    def on_yaw(self, msg):
+    def on_pose(self, msg):
         # Runs inside spin_once (Qt thread), so it can update the labels directly.
-        # msg.data = [sensor yaw, world yaw] in radians; show degrees.
-        def fmt(radians):
+        # msg.data = [sensor x, y, yaw, world x, y, yaw]: metres and radians.
+        if len(msg.data) < 6:
+            return   # old message format (yaw only), ignore
+
+        def fmt_metres(m):
+            return "--" if math.isnan(m) else f"{m:.2f} m"
+
+        def fmt_degrees(radians):
             return "--" if math.isnan(radians) else f"{math.degrees(radians):.1f}°"
 
-        if len(msg.data) >= 1:
-            self.yaw_label.setText(f"Yaw: {fmt(msg.data[0])}")
-        if len(msg.data) >= 2:
-            self.world_yaw_label.setText(f"World yaw: {fmt(msg.data[1])}")
+        for key, start in (("sensors", 0), ("world", 3)):
+            x, y, yaw = msg.data[start:start + 3]
+            labels = self.pose_labels[key]
+            labels[0].setText(fmt_metres(x))
+            labels[1].setText(fmt_metres(y))
+            labels[2].setText(fmt_degrees(yaw))
 
     # ------------------------------------------------------------ map
 

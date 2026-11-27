@@ -24,6 +24,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include "coordinate.hh"
+#include "pose.hh"
 #include "min_max_xy.hh"
 #include "lidar_message.hh"
 #include "ros2_comms.hh"
@@ -40,7 +41,7 @@ Ros2Comms ros2Comms;
 GazeboComms gazeboComms;
 int coordinatesPublisherIndex;
 int logPublisherIndex;
-int yawPublisherIndex = -1;
+int posePublisherIndex = -1;
 
 
 enum class Mode
@@ -114,23 +115,19 @@ LidarMessage latestLidarData;
 std::atomic<bool> running{true};
 std::vector<Coordinate> coordinates;
 RoomScan roomScan;
-std::optional<double> lastPublishedYaw;
+// Sensor pose last sent on /robot/pose.
+std::optional<Pose> lastPublishedPose;
 
 float worldX = 0.0;
 float worldY = 0.0;
 
-// Robot heading in radians (-pi..pi, 0 = facing +x), from /odom.
-// Written by odomCb, read by loop(): both under dataMutex.
-double sensorYaw = 0.0;
-// Robot position from /odom, set by odomCb (under dataMutex).
-double sensorX = 0.0;
-double sensorY = 0.0;
+// Robot pose from /odom (position + heading in radians, -pi..pi,
+// 0 = facing +x). Written by odomCb, read by loop(): both under dataMutex.
+Pose sensorPose;
 bool haveOdom = false;
 // The robot's true pose from Gazebo ("world sim" values), set by worldPoseCb.
 // Under dataMutex, like the odometry values.
-double worldPoseX = 0.0;
-double worldPoseY = 0.0;
-double worldPoseYaw = 0.0;
+Pose worldPose;
 bool haveWorldPose = false;
 // Odometry's own heading, before the offset is applied, and the offset
 // itself: the raw heading at the last reset. currentYaw = rawYaw - yawOffset,
@@ -164,62 +161,59 @@ void setSpeed(double linear, double angular)
 // inside loop(), which already holds it, and locking a std::mutex twice from
 // the same thread deadlocks.
 double getCurrentYaw() {
-  return poseSource == PoseSource::SENSORS ? sensorYaw : worldPoseYaw;
+  return poseSource == PoseSource::SENSORS ? sensorPose.yaw : worldPose.yaw;
 }
 
 // Robot position (model origin, metres) from the selected pose source.
 double getCurrentX() {
-  return poseSource == PoseSource::SENSORS ? sensorX : worldPoseX;
+  return poseSource == PoseSource::SENSORS ? sensorPose.position.x : worldPose.position.x;
 }
 
 double getCurrentY() {
-  return poseSource == PoseSource::SENSORS ? sensorY : worldPoseY;
+  return poseSource == PoseSource::SENSORS ? sensorPose.position.y : worldPose.position.y;
 }
 
-// ROS 2 side, for talking to robot_gui.py. Separate from the Gazebo `node`
-// above. These must live as long as the program: if the service object is
-// destroyed, the service disappears.
-
-// /robot/command: every command from the GUI comes through this one service.
-// Uses AddDiagnostics only because it's a standard service type with a single
-// string request and a success + message reply; its `load_namespace` field
-// carries a JSON object such as {"cmd": "move_and_scan", "angle": 90}.
-rclcpp::Service<diagnostic_msgs::srv::AddDiagnostics>::SharedPtr commandService;
-// Where pose values should come from: "sensors" or "sim" (set by the GUI).
-// Stored only for now: nothing reads it yet.
-
-rclcpp::Publisher<std_msgs::msg::String>::SharedPtr logPublisher;
-rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr coordinatesPublisher;
-// /robot/yaw: [sensor (odometry) yaw, world (Gazebo true) yaw], radians.
-// The world yaw is NaN until Gazebo's pose has arrived.
-rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr yawPublisher;
-// Only publish the yaw when it has moved at least this much (0.5 degrees),
-// so a robot sitting still doesn't send the same value 50 times a second.
+// Only publish when the pose has changed at least this much (0.5 degrees
+// of heading, or 1 cm of position), so a robot sitting still doesn't send
+// the same value 50 times a second.
 constexpr double kYawPublishThreshold = 0.5 * M_PI / 180.0;
-// World yaw last sent on /robot/yaw (the sensor one is lastPublishedYaw).
-std::optional<double> lastPublishedWorldYaw;
+constexpr double kPositionPublishThreshold = 0.01;   // metres
+// World pose last sent on /robot/pose (the sensor one is lastPublishedPose).
+std::optional<Pose> lastPublishedWorldPose;
 
-// Send [sensor yaw, world yaw] on /robot/yaw.
+// Send [sensor x, y, yaw, world x, y, yaw] on /robot/pose.
+// The world values are NaN until Gazebo's pose has arrived.
 // Call with dataMutex held.
-void publishYaws()
+void publishPose()
 {
-  if (yawPublisherIndex < 0)
+  if (posePublisherIndex < 0)
     return;   // publisher not set up yet
-  std_msgs::msg::Float64MultiArray yawMsg;
-  yawMsg.data.push_back(sensorYaw);
-  yawMsg.data.push_back(haveWorldPose ? worldPoseYaw : std::nan(""));
-  ros2Comms.publish(yawPublisherIndex, yawMsg);
-  lastPublishedYaw = sensorYaw;
+  const double unknown = std::nan("");
+  std_msgs::msg::Float64MultiArray poseMsg;
+  poseMsg.data = {
+    sensorPose.position.x,
+    sensorPose.position.y,
+    sensorPose.yaw,
+    haveWorldPose ? worldPose.position.x : unknown,
+    haveWorldPose ? worldPose.position.y : unknown,
+    haveWorldPose ? worldPose.yaw : unknown,
+  };
+  ros2Comms.publish(posePublisherIndex, poseMsg);
+  lastPublishedPose = sensorPose;
   if (haveWorldPose)
-    lastPublishedWorldYaw = worldPoseYaw;
+    lastPublishedWorldPose = worldPose;
 }
 
-// True if `yaw` has moved at least the threshold since `last` was sent
-// (or nothing has been sent yet).
-bool yawChanged(double yaw, const std::optional<double> &last)
+// True if `pose` has turned or moved at least the threshold since `last`
+// was sent (or nothing has been sent yet).
+bool poseChanged(const Pose &pose, const std::optional<Pose> &last)
 {
-  return !last.has_value() ||
-         std::fabs(normalizeAngle(yaw - last.value())) >= kYawPublishThreshold;
+  if (!last.has_value())
+    return true;   // nothing sent yet
+  double turned = std::fabs(normalizeAngle(pose.yaw - last->yaw));
+  double moved = std::hypot(pose.position.x - last->position.x,
+                            pose.position.y - last->position.y);
+  return turned >= kYawPublishThreshold || moved >= kPositionPublishThreshold;
 }
 
 // Send a line of text on /robot/log. The publisher takes a std_msgs String
@@ -244,14 +238,14 @@ void odomCb(const gz::msgs::Odometry &msg)
   // Heading from the orientation quaternion (rotation about z).
   const auto &q = msg.pose().orientation();
   std::lock_guard<std::mutex> lock(dataMutex);
-  sensorYaw = quatToYaw(q);
-  sensorX = msg.pose().position().x();
-  sensorY = msg.pose().position().y();
+  sensorPose.yaw = quatToYaw(q);
+  sensorPose.position.x = msg.pose().position().x();
+  sensorPose.position.y = msg.pose().position().y();
   haveOdom = true;
 
   // Publish when it has changed enough (or for the very first reading).
-  if (yawChanged(sensorYaw, lastPublishedYaw))
-    publishYaws();
+  if (poseChanged(sensorPose, lastPublishedPose))
+    publishPose();
 }
 
 
@@ -265,13 +259,13 @@ void worldPoseCb(const gz::msgs::Pose_V &msg)
   {
     if (pose.name() == "vehicle_blue")
     {
-      worldPoseX = pose.position().x();
-      worldPoseY = pose.position().y();
-      worldPoseYaw = quatToYaw(pose.orientation());
+      worldPose.position.x = pose.position().x();
+      worldPose.position.y = pose.position().y();
+      worldPose.yaw = quatToYaw(pose.orientation());
       haveWorldPose = true;
       // Publish when the true heading has changed enough.
-      if (yawChanged(worldPoseYaw, lastPublishedWorldYaw))
-        publishYaws();
+      if (poseChanged(worldPose, lastPublishedWorldPose))
+        publishPose();
       return;
     }
   }
@@ -380,11 +374,11 @@ void resetMode() {
   waitingForLidarData = false;
   // The direction the robot faces now becomes the new 0.
   yawOffset = rawYaw;
-  sensorYaw = 0.0;
-  worldPoseYaw = 0.0;
+  sensorPose.yaw = 0.0;
+  worldPose.yaw = 0.0;
   coordinates.clear();
   setSpeed(0.0, 0.0);   // in case a reset arrives mid-turn
-  publishYaws();
+  publishPose();
 }
 
 // ---------------------------------------------------------------- commands
@@ -494,8 +488,8 @@ void setUpGuiCommunication()
   int commandServiceIndex = ros2Comms.addService("/robot/command", handleCommand);
   logPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::String>("/robot/log");
   coordinatesPublisherIndex = ros2Comms.addPublisher<sensor_msgs::msg::PointCloud2>("/robot/coordinates");
-  yawPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>(
-      "/robot/yaw", rclcpp::QoS(1).transient_local());
+  posePublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>(
+      "/robot/pose", rclcpp::QoS(1).transient_local());
 
 }
 
@@ -535,7 +529,7 @@ void processLidarData(bool clearCoordinates = true) {
   }
   std_msgs::msg::String logMsg;
   double currentYaw = getCurrentYaw();
-  logMsg.data = "Current yaw in lidar calc: " + radiansToDegreesString(currentYaw) + " - World yaw: " + radiansToDegreesString(worldPoseYaw);
+  logMsg.data = "Current yaw in lidar calc: " + radiansToDegreesString(currentYaw) + " - World yaw: " + radiansToDegreesString(worldPose.yaw);
   ros2Comms.publish(logPublisherIndex, logMsg);
   double angle = msg.angle_min();
   double angleIncrement = msg.angle_step();
