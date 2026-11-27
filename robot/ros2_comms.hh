@@ -8,6 +8,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <diagnostic_msgs/srv/add_diagnostics.hpp>
 #include "coordinate.hh"
+#include "map_message.hh"
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
 class Ros2Comms
@@ -18,7 +19,11 @@ public:
     void init(std::string nodeName);
     void shutdown();
     int addService(const std::string &serviceName, Handler handler);
-    void publish2DCoordinates(int publisherIndex, std::vector<Coordinate> &coordinates);
+    void publish2DCoordinates(int publisherIndex, const std::vector<Coordinate> &coordinates);
+    // Publish a map: its points as a PointCloud2 on coordinatesIndex, and its
+    // walls as a Float64MultiArray on wallsIndex, 4 values per wall:
+    // [start x, start y, end x, end y, ...] in metres.
+    void publishMap(int coordinatesIndex, int wallsIndex, const MapMessage &map);
 
     template <typename T>
     int addPublisher(std::string topicName,

@@ -29,6 +29,7 @@
 #include "lidar_message.hh"
 #include "ros2_comms.hh"
 #include "gazebo_comms.hh"
+#include "map.hh"
 
 void loop();
 void handleInterrupt(int signal);
@@ -39,7 +40,9 @@ std::string radiansToDegreesString(double radians);
 const double LIDAR_OFFSET_X = 1.3;
 Ros2Comms ros2Comms;
 GazeboComms gazeboComms;
+Map map;
 int coordinatesPublisherIndex;
+int wallsPublisherIndex;
 int logPublisherIndex;
 int posePublisherIndex = -1;
 
@@ -113,7 +116,7 @@ std::mutex dataMutex;
 bool waitingForLidarData = false;
 LidarMessage latestLidarData;
 std::atomic<bool> running{true};
-std::vector<Coordinate> coordinates;
+
 RoomScan roomScan;
 // Sensor pose last sent on /robot/pose.
 std::optional<Pose> lastPublishedPose;
@@ -376,7 +379,7 @@ void resetMode() {
   yawOffset = rawYaw;
   sensorPose.yaw = 0.0;
   worldPose.yaw = 0.0;
-  coordinates.clear();
+  map.clear();
   setSpeed(0.0, 0.0);   // in case a reset arrives mid-turn
   publishPose();
 }
@@ -488,6 +491,8 @@ void setUpGuiCommunication()
   int commandServiceIndex = ros2Comms.addService("/robot/command", handleCommand);
   logPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::String>("/robot/log");
   coordinatesPublisherIndex = ros2Comms.addPublisher<sensor_msgs::msg::PointCloud2>("/robot/coordinates");
+  // Walls found in the map: [start x, start y, end x, end y] per wall, metres.
+  wallsPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>("/robot/walls");
   posePublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>(
       "/robot/pose", rclcpp::QoS(1).transient_local());
 
@@ -525,7 +530,7 @@ void rotateCoordinates(
 void processLidarData(bool clearCoordinates = true) {
   const gz::msgs::LaserScan &msg = latestLidarData.getMessage();
   if (clearCoordinates) {
-    coordinates.clear();
+    map.clear();
   }
   std_msgs::msg::String logMsg;
   double currentYaw = getCurrentYaw();
@@ -563,19 +568,16 @@ void processLidarData(bool clearCoordinates = true) {
         angle += angleIncrement;
     }
 
-//    rotateCoordinates(newCoordinates, currentYaw);
-  coordinates.insert(
-      coordinates.end(),
-      newCoordinates.begin(),
-      newCoordinates.end()
-  );
+  map.insert(newCoordinates);
+  map.update();
 }
 
 // Publish every point in `coordinates` on /robot/coordinates as a point cloud
 // (x, y, z with z = 0), in the "world" frame.
 void publishCoordinates() {
-  ros2Comms.publish2DCoordinates(coordinatesPublisherIndex, coordinates);
-  std::cout << "Published " << coordinates.size() << " coordinates" << std::endl;
+  MapMessage mapMessage = map.getMessage();
+  ros2Comms.publishMap(coordinatesPublisherIndex, wallsPublisherIndex, mapMessage);
+  std::cout << "Published coordinates" << std::endl;
 }
 
 

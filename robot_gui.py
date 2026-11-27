@@ -1,4 +1,5 @@
 import sys
+import signal
 import math
 from PySide6.QtWidgets import (
     QApplication, QWidget, QPushButton,
@@ -11,6 +12,7 @@ from datetime import datetime
 
 import rclpy
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.signals import SignalHandlerOptions
 import json
 # /robot/command uses AddDiagnostics only because it's a standard service with
 # a single string request (load_namespace) and a success + message reply.
@@ -23,6 +25,8 @@ from sensor_msgs_py import point_cloud2
 # Every command to the robot program goes through this one service.
 COMMAND_SERVICE = "/robot/command"
 COORDINATES_TOPIC = "/robot/coordinates"
+# Walls found by the robot: [start x, start y, end x, end y] per wall, metres.
+WALLS_TOPIC = "/robot/walls"
 LOG_TOPIC = "/robot/log"
 POSE_TOPIC = "/robot/pose"
 # Where the robot's position/heading should come from:
@@ -32,6 +36,7 @@ POSE_SOURCE_WORLD = "world"
 
 MAP_SIZE = 400      # bitmap width and height in pixels
 MAP_MARGIN = 20     # empty border around the points, in pixels
+WALL_COLOUR = QColor(230, 120, 20)   # orange
 
 # Colours for the two pose sources, used by the heading dial and the table.
 SENSORS_COLOUR = QColor(31, 119, 180)   # blue
@@ -104,8 +109,15 @@ class RobotGUI(QWidget):
         # sent to it again.
         self.node_was_available = False
 
-        # Newest point cloud received, or None if nothing new since last draw.
+        # Newest point cloud / walls received, or None if nothing new since
+        # the last draw.
         self.latest_cloud = None
+        self.latest_walls = None
+        # What's currently drawn, so either can be redrawn with the other.
+        self.map_points = []   # [(x, y), ...]
+        self.map_walls = []    # [((x1, y1), (x2, y2)), ...]
+        self.walls_sub = ros_node.create_subscription(
+            Float64MultiArray, WALLS_TOPIC, self.on_walls, 10)
         self.coordinates_sub = ros_node.create_subscription(
             PointCloud2, COORDINATES_TOPIC, self.on_coordinates, 10)
         self.messages_sub = ros_node.create_subscription(
@@ -222,8 +234,7 @@ class RobotGUI(QWidget):
         # Let ROS 2 process replies from inside the Qt event loop: every 50 ms,
         # handle anything that has arrived, without blocking the window.
         self.ros_timer = QTimer(self)
-        self.ros_timer.timeout.connect(
-            lambda: rclpy.spin_once(self.ros_node, timeout_sec=0))
+        self.ros_timer.timeout.connect(self.spin_ros)
         self.ros_timer.start(50)
 
         # Once a second, redraw the map if new coordinates have arrived.
@@ -314,25 +325,39 @@ class RobotGUI(QWidget):
 
     # ------------------------------------------------------------ map
 
+    def spin_ros(self):
+        # Skip if ROS has already shut down (e.g. while the app is closing).
+        if rclpy.ok():
+            rclpy.spin_once(self.ros_node, timeout_sec=0)
+
+    def on_walls(self, msg):
+        # Runs inside spin_once. Keep the newest; drawn with the points below.
+        d = msg.data
+        self.latest_walls = [((d[i], d[i + 1]), (d[i + 2], d[i + 3]))
+                             for i in range(0, len(d) - 3, 4)]
+
     def on_coordinates(self, msg):
         # Runs inside spin_once. Just keep the newest message; drawing happens
         # in check_for_new_coordinates, at most once a second.
         self.latest_cloud = msg
 
     def check_for_new_coordinates(self):
-        if self.latest_cloud is None:
+        if self.latest_cloud is None and self.latest_walls is None:
             return
-        msg = self.latest_cloud
-        self.latest_cloud = None
-
-        xy = point_cloud2.read_points_numpy(msg, field_names=("x", "y"))
-        points = [(float(x), float(y)) for x, y in xy]
-        self.draw_map(points)
+        if self.latest_cloud is not None:
+            xy = point_cloud2.read_points_numpy(self.latest_cloud, field_names=("x", "y"))
+            self.map_points = [(float(x), float(y)) for x, y in xy]
+            self.latest_cloud = None
+        if self.latest_walls is not None:
+            self.map_walls = self.latest_walls
+            self.latest_walls = None
+        self.draw_map(self.map_points, self.map_walls)
 
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.map_info.setText(f"{len(points)} points, updated {timestamp}")
+        self.map_info.setText(f"{len(self.map_points)} points, "
+                              f"{len(self.map_walls)} walls, updated {timestamp}")
 
-    def draw_map(self, points):
+    def draw_map(self, points, walls=()):
         pixmap = QPixmap(MAP_SIZE, MAP_SIZE)
         pixmap.fill(QColor("white"))
         painter = QPainter(pixmap)
@@ -340,8 +365,9 @@ class RobotGUI(QWidget):
 
         # Fit everything in view: all the points, plus the origin (0, 0) so
         # you can see where the robot started relative to the walls.
-        xs = [x for x, _ in points] + [0.0]
-        ys = [y for _, y in points] + [0.0]
+        wall_ends = [end for wall in walls for end in wall]
+        xs = [x for x, _ in points] + [x for x, _ in wall_ends] + [0.0]
+        ys = [y for _, y in points] + [y for _, y in wall_ends] + [0.0]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         span = max(max_x - min_x, max_y - min_y, 1.0)   # metres; never 0
@@ -359,6 +385,11 @@ class RobotGUI(QWidget):
         painter.setPen(QPen(QColor("black"), 2))
         for x, y in points:
             painter.drawPoint(to_pixel(x, y))
+
+        # Walls: thick orange lines over the points.
+        painter.setPen(QPen(WALL_COLOUR, 3, Qt.SolidLine, Qt.RoundCap))
+        for (x1, y1), (x2, y2) in walls:
+            painter.drawLine(to_pixel(x1, y1), to_pixel(x2, y2))
 
         # Origin: red cross.
         origin = to_pixel(0.0, 0.0)
@@ -381,6 +412,9 @@ class RobotGUI(QWidget):
         # Drop any cloud not drawn yet, so the 1 s redraw can't bring old
         # points back, then draw an empty map.
         self.latest_cloud = None
+        self.latest_walls = None
+        self.map_points = []
+        self.map_walls = []
         self.draw_map([])
         self.map_info.setText(f"Map cleared, waiting for {COORDINATES_TOPIC}...")
 
@@ -399,15 +433,21 @@ class RobotGUI(QWidget):
         self.send_command({"cmd": "reset"}, "Reset")
 
 
-rclpy.init()
+# Don't let rclpy handle Ctrl+C: it would shut ROS down while the window
+# keeps running. Instead Ctrl+C quits the Qt app, and ROS is shut down
+# cleanly below once the event loop has stopped.
+rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
 ros_node = rclpy.create_node("robot_gui")
 
 app = QApplication(sys.argv)
+# Python only runs this handler between bits of Python code; the 50 ms ROS
+# timer makes sure that happens often, so Ctrl+C takes effect quickly.
+signal.signal(signal.SIGINT, lambda *args: app.quit())
 window = RobotGUI(ros_node)
 window.show()
 
 exit_code = app.exec()
 
 ros_node.destroy_node()
-rclpy.shutdown()
+rclpy.try_shutdown()
 sys.exit(exit_code)

@@ -1,5 +1,6 @@
 #include "ros2_comms.hh"
 #include <sensor_msgs/point_cloud2_iterator.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 
 void Ros2Comms::init(std::string nodeName) {
@@ -43,7 +44,7 @@ services.push_back(service);
   return static_cast<int>(services.size() - 1);   // index of the one just added
 }
 
-void Ros2Comms::publish2DCoordinates(int publisherIndex, std::vector<Coordinate> &coordinates) {
+void Ros2Comms::publish2DCoordinates(int publisherIndex, const std::vector<Coordinate> &coordinates) {
 
   sensor_msgs::msg::PointCloud2 cloud;
   cloud.header.stamp = rosNode->now();
@@ -66,4 +67,16 @@ void Ros2Comms::publish2DCoordinates(int publisherIndex, std::vector<Coordinate>
   }
 
   publish(publisherIndex, cloud);
+}
+void Ros2Comms::publishMap(int coordinatesIndex, int wallsIndex, const MapMessage &map) {
+  publish2DCoordinates(coordinatesIndex, map.coordinates);
+
+  std_msgs::msg::Float64MultiArray wallsMsg;
+  for (const Wall &wall : map.walls) {
+    wallsMsg.data.push_back(wall.start.x);
+    wallsMsg.data.push_back(wall.start.y);
+    wallsMsg.data.push_back(wall.end.x);
+    wallsMsg.data.push_back(wall.end.y);
+  }
+  publish(wallsIndex, wallsMsg);
 }
