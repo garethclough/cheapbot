@@ -43,6 +43,7 @@ GazeboComms gazeboComms;
 Map map;
 int coordinatesPublisherIndex;
 int wallsPublisherIndex;
+int roomPublisherIndex;
 int logPublisherIndex;
 int posePublisherIndex = -1;
 
@@ -493,6 +494,8 @@ void setUpGuiCommunication()
   coordinatesPublisherIndex = ros2Comms.addPublisher<sensor_msgs::msg::PointCloud2>("/robot/coordinates");
   // Walls found in the map: [start x, start y, end x, end y] per wall, metres.
   wallsPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>("/robot/walls");
+  // Room size and corners: [area, perimeter, corner1 x, corner1 y, ...].
+  roomPublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>("/robot/room");
   posePublisherIndex = ros2Comms.addPublisher<std_msgs::msg::Float64MultiArray>(
       "/robot/pose", rclcpp::QoS(1).transient_local());
 
@@ -576,7 +579,8 @@ void processLidarData(bool clearCoordinates = true) {
 // (x, y, z with z = 0), in the "world" frame.
 void publishCoordinates() {
   MapMessage mapMessage = map.getMessage();
-  ros2Comms.publishMap(coordinatesPublisherIndex, wallsPublisherIndex, mapMessage);
+  ros2Comms.publishMap(coordinatesPublisherIndex, wallsPublisherIndex,
+                       roomPublisherIndex, mapMessage);
   std::cout << "Published coordinates" << std::endl;
 }
 

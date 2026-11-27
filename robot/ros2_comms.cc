@@ -68,7 +68,8 @@ void Ros2Comms::publish2DCoordinates(int publisherIndex, const std::vector<Coord
 
   publish(publisherIndex, cloud);
 }
-void Ros2Comms::publishMap(int coordinatesIndex, int wallsIndex, const MapMessage &map) {
+void Ros2Comms::publishMap(int coordinatesIndex, int wallsIndex, int roomIndex,
+                           const MapMessage &map) {
   publish2DCoordinates(coordinatesIndex, map.coordinates);
 
   std_msgs::msg::Float64MultiArray wallsMsg;
@@ -79,4 +80,13 @@ void Ros2Comms::publishMap(int coordinatesIndex, int wallsIndex, const MapMessag
     wallsMsg.data.push_back(wall.end.y);
   }
   publish(wallsIndex, wallsMsg);
+
+  std_msgs::msg::Float64MultiArray roomMsg;
+  roomMsg.data.push_back(map.room.area);
+  roomMsg.data.push_back(map.room.perimeter);
+  for (const Corner &corner : map.corners) {
+    roomMsg.data.push_back(corner.x);
+    roomMsg.data.push_back(corner.y);
+  }
+  publish(roomIndex, roomMsg);
 }

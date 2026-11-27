@@ -27,6 +27,8 @@ COMMAND_SERVICE = "/robot/command"
 COORDINATES_TOPIC = "/robot/coordinates"
 # Walls found by the robot: [start x, start y, end x, end y] per wall, metres.
 WALLS_TOPIC = "/robot/walls"
+# Room size and corners: [area, perimeter, corner1 x, corner1 y, ...].
+ROOM_TOPIC = "/robot/room"
 LOG_TOPIC = "/robot/log"
 POSE_TOPIC = "/robot/pose"
 # Where the robot's position/heading should come from:
@@ -37,6 +39,7 @@ POSE_SOURCE_WORLD = "world"
 MAP_SIZE = 400      # bitmap width and height in pixels
 MAP_MARGIN = 20     # empty border around the points, in pixels
 WALL_COLOUR = QColor(230, 120, 20)   # orange
+CORNER_COLOUR = QColor(150, 60, 190)  # purple
 
 # Colours for the two pose sources, used by the heading dial and the table.
 SENSORS_COLOUR = QColor(31, 119, 180)   # blue
@@ -113,9 +116,13 @@ class RobotGUI(QWidget):
         # the last draw.
         self.latest_cloud = None
         self.latest_walls = None
-        # What's currently drawn, so either can be redrawn with the other.
+        self.latest_room = None
+        # What's currently drawn, so each can be redrawn with the others.
         self.map_points = []   # [(x, y), ...]
         self.map_walls = []    # [((x1, y1), (x2, y2)), ...]
+        self.map_corners = []  # [(x, y), ...] in order round the room
+        self.room_sub = ros_node.create_subscription(
+            Float64MultiArray, ROOM_TOPIC, self.on_room, 10)
         self.walls_sub = ros_node.create_subscription(
             Float64MultiArray, WALLS_TOPIC, self.on_walls, 10)
         self.coordinates_sub = ros_node.create_subscription(
@@ -196,6 +203,7 @@ class RobotGUI(QWidget):
         self.map_label.setFixedSize(MAP_SIZE, MAP_SIZE)
         self.map_label.setAlignment(Qt.AlignCenter)
         self.map_info = QLabel(f"Waiting for {COORDINATES_TOPIC}...")
+        self.room_info = QLabel("Room: --")
         self.draw_map([])
 
         self.messages = QTextEdit()
@@ -227,6 +235,7 @@ class RobotGUI(QWidget):
         layout.addLayout(angle_row)
         layout.addWidget(self.map_label, alignment=Qt.AlignHCenter)
         layout.addWidget(self.map_info)
+        layout.addWidget(self.room_info)
         layout.addWidget(self.messages)
 
         self.setLayout(layout)
@@ -336,13 +345,22 @@ class RobotGUI(QWidget):
         self.latest_walls = [((d[i], d[i + 1]), (d[i + 2], d[i + 3]))
                              for i in range(0, len(d) - 3, 4)]
 
+    def on_room(self, msg):
+        # Runs inside spin_once. [area, perimeter, x1, y1, x2, y2, ...].
+        d = msg.data
+        if len(d) < 2:
+            return
+        corners = [(d[i], d[i + 1]) for i in range(2, len(d) - 1, 2)]
+        self.latest_room = (d[0], d[1], corners)
+
     def on_coordinates(self, msg):
         # Runs inside spin_once. Just keep the newest message; drawing happens
         # in check_for_new_coordinates, at most once a second.
         self.latest_cloud = msg
 
     def check_for_new_coordinates(self):
-        if self.latest_cloud is None and self.latest_walls is None:
+        if (self.latest_cloud is None and self.latest_walls is None
+                and self.latest_room is None):
             return
         if self.latest_cloud is not None:
             xy = point_cloud2.read_points_numpy(self.latest_cloud, field_names=("x", "y"))
@@ -351,13 +369,23 @@ class RobotGUI(QWidget):
         if self.latest_walls is not None:
             self.map_walls = self.latest_walls
             self.latest_walls = None
-        self.draw_map(self.map_points, self.map_walls)
+        if self.latest_room is not None:
+            area, perimeter, self.map_corners = self.latest_room
+            self.latest_room = None
+            if len(self.map_corners) >= 3:
+                self.room_info.setText(
+                    f"Room: area {area:.2f} m², perimeter {perimeter:.2f} m, "
+                    f"{len(self.map_corners)} corners")
+            else:
+                self.room_info.setText(
+                    f"Room: not enough corners yet ({len(self.map_corners)} found)")
+        self.draw_map(self.map_points, self.map_walls, self.map_corners)
 
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.map_info.setText(f"{len(self.map_points)} points, "
                               f"{len(self.map_walls)} walls, updated {timestamp}")
 
-    def draw_map(self, points, walls=()):
+    def draw_map(self, points, walls=(), corners=()):
         pixmap = QPixmap(MAP_SIZE, MAP_SIZE)
         pixmap.fill(QColor("white"))
         painter = QPainter(pixmap)
@@ -366,8 +394,8 @@ class RobotGUI(QWidget):
         # Fit everything in view: all the points, plus the origin (0, 0) so
         # you can see where the robot started relative to the walls.
         wall_ends = [end for wall in walls for end in wall]
-        xs = [x for x, _ in points] + [x for x, _ in wall_ends] + [0.0]
-        ys = [y for _, y in points] + [y for _, y in wall_ends] + [0.0]
+        xs = [x for x, _ in points] + [x for x, _ in wall_ends] + [x for x, _ in corners] + [0.0]
+        ys = [y for _, y in points] + [y for _, y in wall_ends] + [y for _, y in corners] + [0.0]
         min_x, max_x = min(xs), max(xs)
         min_y, max_y = min(ys), max(ys)
         span = max(max_x - min_x, max_y - min_y, 1.0)   # metres; never 0
@@ -391,6 +419,15 @@ class RobotGUI(QWidget):
         for (x1, y1), (x2, y2) in walls:
             painter.drawLine(to_pixel(x1, y1), to_pixel(x2, y2))
 
+        # Corners: purple dots, numbered in the order round the room.
+        painter.setPen(QPen(CORNER_COLOUR, 1))
+        painter.setBrush(CORNER_COLOUR)
+        for number, (x, y) in enumerate(corners, start=1):
+            centre = to_pixel(x, y)
+            painter.drawEllipse(centre, 5, 5)
+            painter.drawText(centre + QPointF(7, -7), str(number))
+        painter.setBrush(Qt.NoBrush)
+
         # Origin: red cross.
         origin = to_pixel(0.0, 0.0)
         painter.setPen(QPen(QColor("red"), 2))
@@ -413,8 +450,11 @@ class RobotGUI(QWidget):
         # points back, then draw an empty map.
         self.latest_cloud = None
         self.latest_walls = None
+        self.latest_room = None
         self.map_points = []
         self.map_walls = []
+        self.map_corners = []
+        self.room_info.setText("Room: --")
         self.draw_map([])
         self.map_info.setText(f"Map cleared, waiting for {COORDINATES_TOPIC}...")
 

@@ -1,6 +1,8 @@
 #include "map.hh"
 #include "coordinate.hh"
 #include "wall.hh"
+#include "corner.hh"
+#include "room_metrics.hh"
 
 #include <iostream>
 #include <vector>
@@ -251,13 +253,201 @@ std::vector<Wall> detectWalls(std::vector<Coordinate> &coordinates)
     return walls;
 }
 
+// Check whether an intersection lies within or close to
+// the finite extent of a wall segment.
+bool nearWallSegment(
+    const Corner& p,
+    const Wall& wall,
+    double tolerance)
+{
+    double dx = wall.end.x - wall.start.x;
+    double dy = wall.end.y - wall.start.y;
+
+    double lengthSquared = dx * dx + dy * dy;
+
+    if (lengthSquared < 1e-12)
+        return false;
+
+    double t = (
+        (p.x - wall.start.x) * dx +
+        (p.y - wall.start.y) * dy
+    ) / lengthSquared;
+
+    double extension = tolerance / std::sqrt(lengthSquared);
+
+    return t >= -extension && t <= 1.0 + extension;
+}
+
+// Calculate intersection of two wall lines
+bool intersectWalls(
+    const Wall& w1,
+    const Wall& w2,
+    Corner& corner)
+{
+    double determinant =
+        w1.a * w2.b - w2.a * w1.b;
+
+    if (std::abs(determinant) < 1e-8)
+        return false;
+
+    corner.x = (
+        w1.b * w2.c - w2.b * w1.c
+    ) / determinant;
+
+    corner.y = (
+        w1.c * w2.a - w2.c * w1.a
+    ) / determinant;
+
+    return true;
+}
+
+// Remove duplicate corners
+std::vector<Corner> detectCorners(
+    const std::vector<Wall>& walls,
+    double tolerance = 0.20)
+{
+    std::vector<Corner> corners;
+
+    for (size_t i = 0; i < walls.size(); ++i) {
+        for (size_t j = i + 1; j < walls.size(); ++j) {
+
+            Corner corner;
+
+            if (!intersectWalls(
+                walls[i], walls[j], corner))
+                continue;
+
+            // Ensure the intersection belongs to both
+            // finite wall segments, not just their extensions.
+            if (!nearWallSegment(
+                corner, walls[i], tolerance))
+                continue;
+
+            if (!nearWallSegment(
+                corner, walls[j], tolerance))
+                continue;
+
+            // Avoid duplicate corners
+            bool duplicate = false;
+
+            for (const auto& existing : corners) {
+                double distance = std::hypot(
+                    corner.x - existing.x,
+                    corner.y - existing.y
+                );
+
+                if (distance < tolerance) {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (!duplicate)
+                corners.push_back(corner);
+        }
+    }
+
+    return corners;
+}
+
+
+void sortCorners(std::vector<Corner>& corners)
+{
+    if (corners.size() < 3)
+        return;
+
+    double cx = 0;
+    double cy = 0;
+
+    for (const auto& p : corners) {
+        cx += p.x;
+        cy += p.y;
+    }
+
+    cx /= corners.size();
+    cy /= corners.size();
+
+    std::sort(
+        corners.begin(),
+        corners.end(),
+        [cx, cy](const Corner& a, const Corner& b) {
+            double angleA = std::atan2(
+                a.y - cy, a.x - cx
+            );
+
+            double angleB = std::atan2(
+                b.y - cy, b.x - cx
+            );
+
+            return angleA < angleB;
+        }
+    );
+}
+
+
+RoomMetrics calculateRoomSize(
+    const std::vector<Corner>& corners)
+{
+    RoomMetrics result;
+
+    if (corners.size() < 3)
+        return result;
+
+    double twiceArea = 0;
+
+    for (size_t i = 0; i < corners.size(); ++i) {
+
+        const auto& p1 = corners[i];
+        const auto& p2 =
+            corners[(i + 1) % corners.size()];
+
+        twiceArea +=
+            p1.x * p2.y - p2.x * p1.y;
+
+        result.perimeter += std::hypot(
+            p2.x - p1.x,
+            p2.y - p1.y
+        );
+    }
+
+    result.area = std::abs(twiceArea) / 2.0;
+
+    return result;
+}
+
+
 void Map::update() {
     walls = detectWalls(coordinates);
+
+    // Detect corners
+    corners = detectCorners(walls);
+
+    // Sort corners around the room
+    sortCorners(corners);
+
+    // Calculate room dimensions
+    room = calculateRoomSize(corners);
+
+    // Display results
+    std::cout << "\nDetected corners:\n";
+
+    for (size_t i = 0; i < corners.size(); ++i) {
+        std::cout << "Corner " << i + 1
+                << ": "
+                << corners[i].x << ", "
+                << corners[i].y << "\n";
+    }
+
+    std::cout << "\nRoom measurements:\n";
+    std::cout << "Area: " << room.area << " m2\n";
+    std::cout << "Perimeter: " << room.perimeter << " m\n";
 }
 
 MapMessage Map::getMessage() const {
     MapMessage message;
     message.walls = walls;
     message.coordinates = coordinates;
+    message.corners = corners;
+    message.room = room;
     return message;
 }

@@ -20,10 +20,14 @@ public:
     void shutdown();
     int addService(const std::string &serviceName, Handler handler);
     void publish2DCoordinates(int publisherIndex, const std::vector<Coordinate> &coordinates);
-    // Publish a map: its points as a PointCloud2 on coordinatesIndex, and its
-    // walls as a Float64MultiArray on wallsIndex, 4 values per wall:
-    // [start x, start y, end x, end y, ...] in metres.
-    void publishMap(int coordinatesIndex, int wallsIndex, const MapMessage &map);
+    // Publish a map:
+    //  - its points as a PointCloud2 on coordinatesIndex
+    //  - its walls as a Float64MultiArray on wallsIndex, 4 values per wall:
+    //    [start x, start y, end x, end y, ...] in metres
+    //  - its room as a Float64MultiArray on roomIndex:
+    //    [area, perimeter, corner1 x, corner1 y, corner2 x, corner2 y, ...]
+    void publishMap(int coordinatesIndex, int wallsIndex, int roomIndex,
+                    const MapMessage &map);
 
     template <typename T>
     int addPublisher(std::string topicName,
